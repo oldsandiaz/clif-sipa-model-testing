@@ -1,0 +1,626 @@
+---
+title: "QC and Table 1"
+author: "Caleb Diaz"
+date: "2025-06-09"
+output: 
+  html_document:
+    code_folding: hide
+    theme: flatly
+runtime: shiny
+---
+
+# Load Data
+
+Load data from cohort identification script. Select all patients that were on life support, when they started life support, when the 48 hour window began, which device they were on, and when the 48 hour window ended.
+
+```{r setup, include = FALSE}
+library(arrow)
+library(shiny)
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+library(stringr)
+library(purrr)
+library(DT)
+library(duckdb)
+library(lubridate)
+library(fuzzyjoin)
+library(data.table)
+
+
+# Set up environment
+set.seed(42)
+rm(list = ls())
+knitr::opts_knit$set(root.dir = '/Users/cdiaz/Desktop/SRP/SRP SOFA/')
+print(getwd())
+print(file.exists("config/config.json"))
+
+# Load data
+data <- read_parquet("/Users/cdiaz/Desktop/SRP/SRP SOFA/output/intermediate/sofaclif_cohort.parquet")
+head(data)
+
+# Set up for DuckDB Connection
+
+## DuckDB Helper function
+read_data <- function(file_path) {
+  if (grepl("\\.csv$", file_path)) {
+    return(read.csv(file_path))
+  } else if (grepl("\\.parquet$", file_path)) {
+    return(arrow::read_parquet(file_path))
+  } else if (grepl("\\.fst$", file_path)) {
+    return(fst::read.fst(file_path))
+  } else {
+    stop("Unsupported file format")
+  }
+}
+
+## DuckDB Writing Function
+write_files_to_duckdb <- function(files, tables_location, file_type, con) {
+  for (file_name in files) {
+    file_path <- file.path(tables_location, paste0(file_name, file_type))
+    data <- as.data.frame(read_data(file_path))
+    table_name <- tools::file_path_sans_ext(file_name)
+    duckdb::dbWriteTable(con, table_name, data, overwrite = TRUE)
+    message("Wrote table: ", table_name, " from file: ", file_name)
+    rm(data)
+  }
+}
+
+## Needed tables
+true_tables <- list("clif_medication_admin_continuous", "clif_patient",
+                    "clif_hospitalization", "clif_adt", "clif_respiratory_support",
+                    "clif_labs", "clif_vitals", "clif_patient_assessments")
+
+# Access configuration parameters
+source("/Users/cdiaz/Desktop/SRP/SRP SOFA/utils/config.R")
+
+site_name <- config$site_name
+tables_path <- config$tables_path
+file_type <- config$file_type
+
+con <- duckdb::dbConnect(duckdb::duckdb(), dbdir = ":memory:")
+write_files_to_duckdb(true_tables, tables_path, file_type, con)
+
+# Add meas_dttm column:
+
+data <- data %>%
+  mutate(
+    # Create time string with leading zero for hour
+    time_str = str_c(str_pad(meas_hour, 2, pad = "0"), "00", "00", sep = ":"),
+    # Concatenate date and time for datetime_str
+    datetime_str = str_c(meas_date, time_str, sep = " "),
+    # Now parse as POSIXct
+    meas_dttm = as.POSIXct(datetime_str, format = "%Y-%m-%d %H:%M:%S", tz = "UTC")
+  ) %>%
+  mutate(
+    # Floor to the nearest hour
+    life_support_start = floor_date(as.POSIXct(life_support_start, tz = "UTC"), unit = "hour"),
+    meas_dttm = floor_date(meas_dttm, unit = "hour")
+  ) %>%
+  # Remove the helper columns
+  select(-time_str, -datetime_str)
+
+patients_on_support <- data %>% 
+  filter(meas_dttm == life_support_start & on_life_support == 1) %>% 
+  select(hospitalization_id, life_support_start, 
+         window_start, window_end, device_filled, meas_dttm, on_life_support)
+```
+
+## Labs
+
+Load labs file. Select `lab_category, lab_result_dttm, lab_value_numeric`. Ensure that `lab_result_dttm` falls within window.
+
+```{r message=FALSE, warning=FALSE}
+required_labs <- c("po2_arterial", "bilirubin_total", "creatinine", "platelet_count")
+labs_hosp <- patients_on_support %>% 
+  left_join(tbl(con, "clif_labs"), by = "hospitalization_id", copy = TRUE) %>%
+  filter(lab_category %in% required_labs) %>% 
+  filter(lab_category == "po2_arterial" & lab_value_numeric > 30 & lab_value_numeric <= 800 |
+           lab_category == "bilirubin_total" & lab_value_numeric > 0 & lab_value_numeric <= 50 |
+           lab_category == "platelet_count" & lab_value_numeric > 0 & lab_value_numeric <= 832 |
+           lab_category == "creatinine" & lab_value_numeric > 0 & lab_value_numeric <= 30) %>%
+  filter(lab_result_dttm >= window_start & lab_result_dttm <= window_end) %>% 
+  collect()
+```
+
+## Vitals
+
+Pull SpO2 and MAP from `clif_vitals`. Ensure that `recorded_dttm` is within window.
+
+```{r message=FALSE, warning=FALSE}
+required_vitals <- c("map", "spo2")
+
+vitals_hosp <- patients_on_support %>% 
+  left_join(tbl(con, "clif_vitals"), by = "hospitalization_id", copy = TRUE) %>% 
+  filter(vital_category %in% required_vitals) %>% 
+  filter((vital_category == "spo2" & vital_value > 60 & vital_value <= 100)) %>%
+  filter(recorded_dttm >= window_start & recorded_dttm <= window_end) %>%
+  rename(recorded_dttm_vitals = recorded_dttm) %>% 
+  collect()
+```
+
+## Medications
+
+Pull vasoactives from `clif_medication_admin_continuous`. Ensure `admin_dttm` is within window.
+
+```{r message=FALSE, warning=FALSE}
+pressors_hosp <- patients_on_support %>% 
+  left_join(tbl(con, "clif_medication_admin_continuous"), 
+            by = "hospitalization_id", copy = TRUE) %>% 
+  filter(med_group == "vasoactives") %>% 
+  filter(admin_dttm >= window_start & admin_dttm <= window_end) %>% 
+  collect()
+```
+
+## Assessments
+
+Pull GCS score. Ensure `recorded_dttm` is within window.
+
+```{r message = FALSE, warning=FALSE}
+gcs_hosp <- patients_on_support %>% 
+  left_join(tbl(con, "clif_patient_assessments"), by = "hospitalization_id", copy = TRUE) %>% 
+  filter(assessment_category == "gcs_total") %>% 
+  filter(numerical_value >= 0) %>% 
+  filter(recorded_dttm >= window_start & recorded_dttm <= window_end) %>% 
+  rename(recorded_dttm_assessments = recorded_dttm) %>% 
+  collect()
+```
+
+## Respiratory Support
+
+Pull `mode_category, lpm_set, fio2_set, peep_set, tidal_volume_set`. Clean `fio2_set` and add in approximations of `fio2_set` based on liters per minute. Filter out CPAP. Ensure `recorded_dttm` is within window. Add FiO2 approximations where applicable.
+
+```{r message = FALSE, warning=FALSE}
+# Load data
+resp_support_hosp <- patients_on_support %>% 
+  left_join(tbl(con, "clif_respiratory_support"), by = "hospitalization_id", copy = TRUE) %>% 
+    filter(recorded_dttm >= window_start & 
+             recorded_dttm <= window_end) %>% 
+  select(hospitalization_id, recorded_dttm, mode_category, 
+         device_category, lpm_set, fio2_set, peep_set, tidal_volume_set) %>% 
+  filter(!(device_category == "CPAP" & (is.na(fio2_set) | fio2_set < 0.3))) %>% 
+  mutate(fio2_set_clean = ifelse(fio2_set < 0.21 | fio2_set > 1, NA, fio2_set)) %>%
+  rename(recorded_dttm_resp = recorded_dttm) %>% 
+  collect()
+
+# Create a new device category column.
+resp_support_hosp <- resp_support_hosp %>% 
+  mutate(device_category_2 = case_when(
+    !is.na(device_category) ~ device_category,
+    mode_category %in% c("SIMV", "Pressure-regulated Volume Control", "Assist Control-Volume Control") ~ "Vent",
+    is.na(device_category) & fio2_set_clean == 0.21 & is.na(lpm_set) & is.na(peep_set) & is.na(tidal_volume_set) ~ "Room Air",
+    is.na(device_category) & is.na(fio2_set_clean) & lpm_set == 0 & is.na(peep_set) & is.na(tidal_volume_set) ~ "Room Air",
+    is.na(device_category) & is.na(fio2_set_clean) & lpm_set <= 20 & lpm_set > 0 & is.na(peep_set) & is.na(tidal_volume_set) ~ "Nasal Cannula",
+    is.na(device_category) & is.na(fio2_set_clean) & lpm_set > 20 & is.na(peep_set) & is.na(tidal_volume_set) ~ "High Flow NC",
+    device_category == "Nasal Cannula" & is.na(fio2_set_clean) & lpm_set > 20 ~ "High Flow NC",
+    TRUE ~ device_category # Keep original device_category if no condition is met
+  ))
+
+# Add FiO2 approximations
+fio2_lookup <- c(
+  `1` = 0.24, `2` = 0.28, `3` = 0.32, `4` = 0.36, `5` = 0.40,
+  `6` = 0.44, `7` = 0.48, `8` = 0.52, `9` = 0.56, `10` = 0.60
+)
+
+resp_support_hosp <- resp_support_hosp %>%
+  mutate(fio2_approx = case_when(
+    !is.na(fio2_set_clean) ~ fio2_set,
+    is.na(fio2_set_clean) & device_category_2 == "Room Air" ~ 0.21,
+    is.na(fio2_set_clean) & device_category_2 == "Nasal Cannula" ~ (0.21 + (0.04 * lpm_set)),
+    is.na(fio2_set_clean) & device_category_2 == "High Flow NC" ~ (0.48 + ((lpm_set - 6) * 0.02)),
+    is.na(fio2_set_clean) & device_category_2 %in% c("Vent", "NIPPV", "CPAP") ~ fio2_lookup[as.character(lpm_set)],
+    TRUE ~ NA_real_
+  ))
+```
+
+# Combine Data and Add Location
+
+Combine all dataframes into one large dataframe. Use `clif_adt` to add `location_category` based on `event_time` and `in_dttm`/`out_dttm`. If `event_time` falls in between the ADT times, then pull the location category during that timeframe.
+
+```{r}
+# Standardize columns: hospitalization_id, event_time, variable_name, value, source
+
+labs_long <- labs_hosp %>%
+  select(hospitalization_id, event_time = lab_result_dttm, variable_name = lab_category, value = lab_value_numeric) %>%
+  mutate(source = "labs")
+
+vitals_long <- vitals_hosp %>%
+  select(hospitalization_id, event_time = recorded_dttm_vitals, variable_name = vital_category, value = vital_value) %>%
+  mutate(source = "vitals")
+
+gcs_long <- gcs_hosp %>%
+  select(hospitalization_id, event_time = recorded_dttm_assessments, variable_name = assessment_category, value = numerical_value) %>%
+  mutate(source = "gcs")
+
+meds_long <- pressors_hosp %>%
+  select(hospitalization_id, event_time = admin_dttm, variable_name = med_category, value = med_dose) %>%
+  mutate(source = "meds")
+
+resp_long <- resp_support_hosp %>%
+  select(hospitalization_id, event_time = recorded_dttm_resp, variable_name = device_category_2, value = fio2_approx) %>%
+  mutate(source = "resp")
+
+# Combine long
+combined_long <- bind_rows(labs_long, vitals_long, gcs_long, meds_long, resp_long)
+
+final_combined <- combined_long %>%
+  left_join(patients_on_support, by = "hospitalization_id") %>% 
+  arrange(hospitalization_id, event_time)
+
+# Add in location by applying location_category based on in_dttm, out_dttm, and event_time. 
+# I.e. if event_time falls in between in_dttm and out_dttm, then location_category should be in that row.
+
+clif_adt <- tbl(con, "clif_adt") %>% collect()
+
+setDT(final_combined)
+setDT(clif_adt)
+
+final_data <- copy(final_combined)
+final_data[
+  clif_adt,
+  on = .(hospitalization_id, event_time >= in_dttm, event_time <= out_dttm),
+  location_category := i.location_category
+]
+
+rm(clif_adt)
+rm(combined_long)
+rm(final_combined)
+rm(gcs_hosp)
+rm(gcs_long)
+rm(labs_hosp)
+rm(labs_long)
+rm(meds_long)
+rm(pressors_hosp)
+rm(resp_long)
+rm(resp_support_hosp)
+rm(vitals_hosp)
+rm(vitals_long)
+```
+
+# Plot Creation
+
+First, create a time variable called `window_hour` which is negative when `event_time < life_support_start`, positive otherwise.
+
+```{r message = FALSE, warning=FALSE}
+
+final_data <- as.data.frame(final_data)
+final_data <- final_data %>%
+  mutate(variable_name = if_else(source == "resp", 
+                                 "fio2_approx", variable_name))
+final_data <- final_data %>%
+  mutate(event_time = as.POSIXct(event_time),
+         life_support_start = as.POSIXct(life_support_start),
+         window_hour = as.numeric(difftime(event_time, 
+                                           life_support_start, units = "hours")))
+```
+
+Pull a sample of 100 hospitalization IDs.
+
+```{r}
+# Pull a sample of 100 unique hospitalization_ids
+set.seed(42) # for reproducibility
+sample_ids <- final_data %>%
+  distinct(hospitalization_id) %>%
+  sample_n(100) %>%
+  pull(hospitalization_id)
+
+# Create the new dataframe with only the data from sampled hospitalization_ids
+sample_data <- final_data %>%
+  filter(hospitalization_id %in% sample_ids)
+```
+
+First, determine the intervals that a location category spans. This will be used to create the shading objects in `ggplot2`. Second, define a function that creates the set of plots required for each hospitalization, defined by the unique values from the `variable_name` column.
+
+```{r message = FALSE, warning=FALSE}
+location_intervals <- sample_data %>%
+  group_by(hospitalization_id, location_category) %>%
+  summarize(
+    start = min(window_hour, na.rm = TRUE),
+    end = max(window_hour, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+create_patient_plots <- function(data, hospitalization_id) {
+  patient_data <- data %>%
+    filter(hospitalization_id == !!hospitalization_id)
+
+  life_support_window_hour <- unique(
+    patient_data$window_hour[which(patient_data$event_time == unique(patient_data$life_support_start))]
+  )
+  if (length(life_support_window_hour) == 0 || is.na(life_support_window_hour)) life_support_window_hour <- 0
+
+  # Ensure variable column is called 'variable'
+  long_data <- patient_data %>%
+    rename(variable = variable_name)
+
+  # Create continuous location intervals
+  location_intervals <- long_data %>%
+    arrange(window_hour) %>%
+    select(window_hour, location_category) %>%
+    distinct() %>%
+    mutate(
+      xmin = window_hour,
+      xmax = lead(window_hour, default = max(long_data$window_hour, na.rm = TRUE) + 1)
+    ) %>%
+    select(location_category, xmin, xmax)
+
+  plots <- long_data %>%
+    split(.$variable) %>%
+    map(function(.x) {
+      max_y <- max(.x$value, na.rm = TRUE)
+      label_y <- max_y - 0.1 * abs(max_y)
+      ggplot(.x, aes(x = window_hour, y = value)) +
+        geom_rect(
+          data = location_intervals,
+          aes(xmin = xmin, xmax = xmax, ymin = -Inf, ymax = Inf, fill = location_category),
+          inherit.aes = FALSE,
+          alpha = 0.2
+        ) +
+        geom_point() +
+        geom_vline(xintercept = life_support_window_hour, color = "red", linetype = "dashed") +
+        annotate(
+          "text",
+          x = life_support_window_hour,
+          y = label_y,
+          label = "Life Support Start",
+          color = "red",
+          angle = 90,
+          vjust = -0.5,
+          hjust = 0,
+          size = 3,
+          fontface = "bold"
+        ) +
+        labs(
+          title = paste("Hospitalization", hospitalization_id, "-", unique(.x$variable)),
+          x = "Window Hour", y = "Value") +
+        theme_classic() +
+        theme(
+          axis.title.x = element_text(face = "bold"),
+          axis.title.y = element_text(face = "bold"),
+          text = element_text(family = "Arial"),
+          plot.title = element_text(face = "bold")
+        ) + 
+        labs(fill = "Location Category")+
+        theme(
+        legend.title = element_text(face = "bold"),
+        legend.text = element_text(face = "bold"))
+    })
+  return(plots)
+}
+
+all_hosp_ids <- unique(sample_data$hospitalization_id)
+# Matrix of plots to pull from
+plot_matrix <- all_hosp_ids %>%
+  set_names() %>%
+  map(~ suppressWarnings(create_patient_plots(sample_data, .x)))
+```
+
+```{r controls_and_plot, echo = FALSE}
+
+plot_vars <- unique(sample_data$variable_name)
+
+# Controls
+fluidRow(
+  column(6, selectInput("plot_type", "Plot type:", choices = plot_vars)),
+  column(6, selectInput("Hospitalization", "ID:", choices = all_hosp_ids))
+)
+
+renderPlot({
+  req(input$Hospitalization, input$plot_type)
+  plot_matrix[[input$Hospitalization]][[input$plot_type]]
+})
+
+renderDT({
+  req(input$Hospitalization)
+  filtered <- sample_data %>% filter(hospitalization_id == input$Hospitalization)
+  
+  summary_df <- filtered %>%
+    summarise(across(all_of(plot_vars), list(
+      mean = ~mean(.x, na.rm = TRUE),
+      median = ~median(.x, na.rm = TRUE),
+      sd = ~sd(.x, na.rm = TRUE),
+      iqr = ~IQR(.x, na.rm = TRUE),
+      min = ~min(.x, na.rm = TRUE),
+      max = ~max(.x, na.rm = TRUE)
+    )))
+  
+  # Use regex: (.*)_(mean|median|sd|iqr|min|max)\$ to split at the LAST underscore
+  summary_df <- summary_df %>%
+    pivot_longer(
+      everything(),
+      names_to = c("Variable", "Statistic"),
+      names_pattern = "^(.*)_([^_]*)$",
+      values_to = "Value"
+    ) %>%
+    mutate(Value = round(as.numeric(Value),2)) %>% 
+    pivot_wider(names_from = "Statistic", values_from = "Value") %>%
+    arrange(Variable)
+  
+  datatable(
+    summary_df,
+    caption = paste("Summary Table for Hospitalization ID:", input$Hospitalization),
+    rownames = FALSE,
+    options = list(pageLength = nrow(summary_df))
+  )
+})
+```
+
+# Table 1 Creation
+
+```{r eval = FALSE}
+library(dplyr)
+library(tidyr)
+
+data <- data %>%
+  mutate(mortality_group = ifelse(in_hospital_mortality == 1, "In-Hospital Mortality", "Survived"))
+
+# Helper to format counts
+format_count <- function(counts) {
+  pivot_wider(counts, names_from = mortality_group, values_from = value)
+}
+
+# Hospital admissions
+hospitalizations <- data %>%
+  group_by(mortality_group) %>%
+  summarise(value = as.character(n_distinct(hospitalization_id)), .groups = "drop") %>%
+  mutate(variable = "Hospital admissions, n") %>%
+  format_count()
+
+# Patients
+patients <- data %>%
+  group_by(mortality_group) %>%
+  summarise(value = as.character(n_distinct(patient_id)), .groups = "drop") %>%
+  mutate(variable = "Patients, n") %>%
+  format_count()
+
+vaso_cols <- c("norepinephrine", "vasopressin", "phenylephrine", "dopamine", 
+               "milrinone", "epinephrine", "dobutamine", "angiotensin")
+
+# 1. Make sure they're numeric
+data[vaso_cols] <- lapply(data[vaso_cols], function(x) as.numeric(as.character(x)))
+
+# 2. Mark any vasopressor usage per ROW
+data <- data %>%
+  mutate(any_vasopressor = if_any(all_of(vaso_cols), ~ !is.na(.) & . > 0))
+
+hospital_stays <- data %>%
+  group_by(hospitalization_id, mortality_group) %>%
+  summarise(
+    # patient id if available:
+    patient_id = first(patient_id),
+    sex_category = first(sex_category),           
+    age_at_admission = first(age_at_admission),   
+    race_category = first(race_category),        
+    device_filled = paste(unique(device_filled[!is.na(device_filled)]), collapse = ";"),
+    any_vasopressor = as.integer(any(
+      rowSums(select(., norepinephrine, vasopressin, phenylephrine, dopamine, milrinone, epinephrine, dobutamine, angiotensin), na.rm = TRUE) > 0
+    )),
+    .groups = "drop"
+  )
+
+female <- hospital_stays %>%
+  group_by(mortality_group) %>%
+  summarise(
+    n_total = n(),
+    n_female = sum(sex_category == "Female", na.rm = TRUE),
+    pct = round(100 * n_female / n_total, 1),
+    value = paste0(n_female, " (", pct, "%)")
+  ) %>%
+  select(mortality_group, value) %>%
+  mutate(variable = "Female gender, n (%)")
+
+
+# Age
+age <- data %>%
+  group_by(mortality_group) %>%
+  summarise(
+    med = median(age_at_admission, na.rm = TRUE),
+    q1 = quantile(age_at_admission, 0.25, na.rm = TRUE),
+    q3 = quantile(age_at_admission, 0.75, na.rm = TRUE),
+    value = paste0(round(med, 1), " (", round(q1, 1), ", ", round(q3, 1), ")")
+  ) %>%
+  select(mortality_group, value) %>%
+  mutate(variable = "Age, median (25th, 75th)") %>%
+  format_count()
+
+# Race categories
+races <- hospital_stays %>%
+  filter(!is.na(race_category)) %>%
+  group_by(mortality_group, race_category) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  group_by(mortality_group) %>%
+  mutate(pct = round(100 * n / sum(n), 1),
+         value = paste0(n, " (", pct, "%)")) %>%
+  ungroup() %>%
+  mutate(variable = paste0("  ", race_category)) %>%
+  select(variable, mortality_group, value)
+
+# Combine all rows into Table 1
+table1 <- bind_rows(hospitalizations, patients, female, age, races) %>%
+  select(variable, Survived, `In-Hospital Mortality`)
+
+
+# device_type_list: all unique values of device_filled (excluding NAs)
+device_type_list <- unique(na.omit(data$device_filled))
+
+device_tab_list <- lapply(device_type_list, function(dev) {
+  hosp_device <- data %>%
+    group_by(hospitalization_id, mortality_group) %>%
+    summarise(used = any(device_filled == dev, na.rm = TRUE), .groups = "drop")
+  hosp_device %>%
+    group_by(mortality_group) %>%
+    summarise(n = sum(used), pct = round(100 * n / n(), 1), 
+              value = paste0(n, " (", pct, "%)")) %>%
+    mutate(variable = paste0("  Device: ", dev))
+})
+
+device_tab <- bind_rows(device_tab_list)
+
+vaso_tab <- hospital_stays %>%
+  group_by(mortality_group) %>%
+  summarise(
+    n_total = n(),
+    n_vaso = sum(any_vasopressor, na.rm = TRUE),
+    pct = round(100 * n_vaso / n_total, 1),
+    value = paste0(n_vaso, " (", pct, "%)")
+  ) %>%
+  select(mortality_group, value) %>%
+  mutate(variable = "ICU stays requiring any vasopressor, n (%)")
+
+# List of target variables
+vars <- c("fio2_filled", "max_creatinine", "max_bilirubin", "min_plt_count", 
+          "min_map", "min_spo2", "p_f_imputed", "gcs_total")
+
+lab_stats <- lapply(vars, function(var) {
+  # Summarize per hospitalization
+  hosp_lab <- data %>%
+    group_by(hospitalization_id, mortality_group) %>%
+    summarise(
+      all_na = all(is.na(.data[[var]])),                   # TRUE if all NA for this hospitalization
+      lab_median = median(.data[[var]], na.rm = TRUE),
+      lab_q1 = quantile(.data[[var]], 0.25, na.rm = TRUE),
+      lab_q3 = quantile(.data[[var]], 0.75, na.rm = TRUE),
+      .groups = "drop"
+    )
+  
+  # Missingness: per group, how many hospitalizations are missing
+  missing_tab <- hosp_lab %>%
+    group_by(mortality_group) %>%
+    summarise(
+      n_total = n(),
+      n_missing = sum(all_na),
+      missing_pct = round(100 * n_missing / n_total, 1),
+      value = paste0(n_missing, " (", missing_pct, "%)")
+    ) %>%
+    mutate(variable = paste0("  ", var, ", hospitalizations missing measurement, n (%)")) %>%
+    select(variable, mortality_group, value) %>%
+    pivot_wider(names_from = mortality_group, values_from = value)
+  
+  # Lab summaries by group (for hospitalizations with at least one value)
+  non_missing_hosp <- hosp_lab %>% filter(!all_na)
+  summary_tab <- non_missing_hosp %>%
+    group_by(mortality_group) %>%
+    summarise(
+      med = median(lab_median, na.rm = TRUE),
+      q1 = median(lab_q1, na.rm = TRUE),
+      q3 = median(lab_q3, na.rm = TRUE),
+      formatted = paste0(round(med, 2), " (", round(q1, 2), ", ", round(q3, 2), ")")
+    ) %>%
+    mutate(variable = paste0("  ", var, ", median (25th, 75th)")) %>%
+    select(variable, mortality_group, formatted) %>%
+    pivot_wider(names_from = mortality_group, values_from = formatted)
+  
+  # Combine both
+  bind_rows(summary_tab, missing_tab)
+}) %>%
+  bind_rows()
+
+
+
+# Display
+table1_extended <- bind_rows(table1, device_tab, vaso_tab, lab_stats) %>%
+  select(variable, Survived, `In-Hospital Mortality`)
+
+knitr::kable(table1_extended, 
+             caption = "Table 1. Patient Characteristics by In-Hospital Mortality")
+```

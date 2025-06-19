@@ -1,6 +1,8 @@
-# Ignore everything except:
+# Ignore everything
+*
+# But not these files...
 !*.R
 !*.Rmd
-*
 
-.Rproj.user
+# Allow directories (so .R and .Rmd files inside subfolders are tracked)
+!*/
