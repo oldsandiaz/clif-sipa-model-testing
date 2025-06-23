@@ -6,3 +6,4 @@
 
 # Allow directories (so .R and .Rmd files inside subfolders are tracked)
 !*/
+.Rproj.user

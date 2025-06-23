@@ -26,6 +26,8 @@ library(dtplyr)
 library(data.table)
 library(jsonlite)
 
+rm(list = ls())
+
 # DuckDB Helper function
 read_data <- function(file_path) {
   if (grepl("\\.csv$", file_path)) {
@@ -57,7 +59,7 @@ true_tables <- list("clif_medication_admin_continuous", "clif_patient",
                     "clif_labs", "clif_vitals", "clif_patient_assessments")
 
 # Set paths
-output_path <- "/Users/cdiaz/Desktop/SRP/SRP SOFA/output"
+output_path <- "/Users/cdiaz/Desktop/SRP/SRP SOFA/output/intermediate"
 
 source("utils/config.R")
 
@@ -340,7 +342,7 @@ resp_support <- resp_support %>%
 
 In order to associate a respiratory support device to a maximum FiO2, I first need to create an intensity ranking for each possible device category. Then, I will assign the most intense device used in each hour. Finally, I will revert back to the original device categories.
 
-```{r}
+```{r device-category}
 ## First, rank devices in order to select most intense device used for each hour
 ## Second, determine max FiO2 for each hour
 ## Third, associate most intense device with FiO2 for each hour
@@ -413,7 +415,7 @@ rm(hospitalization)
 
 ## Carry Forward Device Name and FiO2
 
-```{r}
+```{r fio2-device-name}
 ## Carry forward device name until another device is recorded 
 ## or the end of the measurement time window
 hosp_by_hour <- hosp_by_hour %>%
@@ -450,7 +452,7 @@ required_lab_names <- c("Platelet Count", "Bilirubin, Total", "Creatinine", "pO2
 
 For each lab, pull values that fall between a specified range. Determine the "worst" lab value for each hour (either minimum or maximum in a given hour).
 
-```{r}
+```{r labs}
 labs <- tbl(con, "clif_labs") %>%
   filter(lab_name %in% required_lab_names) %>% 
   filter(
@@ -561,14 +563,16 @@ rm(vital_min_max_time)
 
 Pull SpO2 and MAP. For each of these, determine the minimum for each hour. I can use SpO2 to further impute PaO2 values that perhaps did not exist before. The calculation used is based on [this paper](https://pubmed.ncbi.nlm.nih.gov/28538439/). Finally, create two ratios: PaO2:FiO2 and SpO2:FiO2.
 
-```{r}
+```{r vitals}
 # Need: SpO2 and MAP
 required_vitals <- c("map", "spo2")
 
 vitals <- tbl(con, "clif_vitals") %>%
   filter(vital_category %in% required_vitals) %>% 
   filter(
-      (vital_category == "spo2" & vital_value > 60 & vital_value <= 100)) %>%
+    (vital_category == "spo2" & vital_value > 60 & vital_value <= 100) |
+    (vital_category == "map" & vital_value > 0 )
+  ) %>%
   inner_join(hosp_ids, by = "hospitalization_id", copy = TRUE) %>% 
   select(hospitalization_id, recorded_dttm, vital_category, vital_value) %>%
   collect()
@@ -642,7 +646,7 @@ hosp_by_hour <- hosp_by_hour %>%
 
 Pull all medications where `med_group == vasoactives`. Determine the number of pressors used in each hour. Separate out dobutamine because of how it is used in the SOFA algorithm regardless of dosing.
 
-```{r}
+```{r medications}
 pressors <- tbl(con, "clif_medication_admin_continuous") %>%
   filter(med_group == "vasoactives") %>%
   mutate(meas_hour = hour(admin_dttm),
@@ -691,7 +695,7 @@ rm(pressors)
 
 The minimum GCS score for each hour is pulled from `clif_patient_assessments`.
 
-```{r}
+```{r assessments}
 # Need: GCS
 ## Load data
 assessments <- tbl(con, "clif_patient_assessments") %>% 
@@ -722,24 +726,36 @@ cohort_table <- cohort_tracking("Adding GCS", hosp_by_hour, cohort_table)
 
 Life support was defined in the following way:
 
--   If the patient was on at least one vasopressor/inotrope, or
-
 -   The patient was on NIPPV mechanical ventilation, HFNC, or
 
--   The P/F ratio was less than 200
+-   The P/F ratio was less than 200, or
+
+-   If the patient was on at least one vasopressor/inotrope
 
 The first episode of life support is defined as the point in which a patient was on life support for more than 6 hours.
 
-```{r}
+```{r life-support}
 ## Flag if on life support in a given hour
 hosp_by_hour <- hosp_by_hour %>%
-  mutate(on_life_support = case_when(
-    num_pressors >= 1 ~ 1,
-    device_filled %in% c('NIPPV', 'Vent', 'High Flow NC') ~ 1,
-    p_f < 200 ~ 1,
-    p_f_imputed < 200 ~ 1,
-    TRUE ~ 0
-  ))
+  mutate(
+    on_life_support = case_when(
+      device_filled %in% c('NIPPV', 'Vent', 'High Flow NC') ~ 1,
+      p_f < 200 ~ 1,
+      p_f_imputed < 200 ~ 1,
+      num_pressors >= 1 ~ 1,
+      TRUE ~ 0
+    ),
+    life_support_reason = case_when(device_filled %in% c('NIPPV', 
+      'Vent', 'High Flow NC') ~ device_filled,
+      p_f < 200 | p_f_imputed < 200 ~ "P:F < 200",
+      num_pressors >= 1 ~ "Pressors",
+      TRUE ~ NA_character_
+    )
+  ) %>% 
+  group_by(hospitalization_id) %>%
+  fill(life_support_reason, .direction = "down") %>%
+  ungroup()
+
 
 ## Create leading flags to identify first episode of 6 consecutive hours of life support
 hosp_by_hour <- hosp_by_hour %>%
@@ -791,7 +807,7 @@ cohort_table <- cohort_tracking("Life Support Only", hosp_by_hour_ls, cohort_tab
 
 Demographic information was brought in via the `clif_patient` table. In addition, a variable `in_hospital_mortality` was defined as a patient dying during the hospitalization in which life support was initiated.
 
-```{r}
+```{r cohort-finalization}
 # Bring in patient demographics
 hosp_patient_ids <- tbl(con, "clif_hospitalization") %>% 
   select(hospitalization_id, patient_id, age_at_admission,
@@ -828,7 +844,4 @@ cohort_table <- cohort_tracking("Final", cohort_final, cohort_table)
 cohort_table
 
 write_parquet(cohort_final, paste0(output_path, "/sofaclif_cohort", ".parquet"))
-
-# Clear
-rm(list = ls())
 ```

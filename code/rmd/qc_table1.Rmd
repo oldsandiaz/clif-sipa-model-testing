@@ -26,6 +26,8 @@ library(duckdb)
 library(lubridate)
 library(fuzzyjoin)
 library(data.table)
+library(gt)
+library(tibble)
 
 
 # Set up environment
@@ -103,7 +105,7 @@ data <- data %>%
 patients_on_support <- data %>% 
   filter(meas_dttm == life_support_start & on_life_support == 1) %>% 
   select(hospitalization_id, life_support_start, 
-         window_start, window_end, device_filled, meas_dttm, on_life_support)
+         window_start, window_end, device_filled, meas_dttm, on_life_support, life_support_reason)
 ```
 
 ## Labs
@@ -133,7 +135,10 @@ required_vitals <- c("map", "spo2")
 vitals_hosp <- patients_on_support %>% 
   left_join(tbl(con, "clif_vitals"), by = "hospitalization_id", copy = TRUE) %>% 
   filter(vital_category %in% required_vitals) %>% 
-  filter((vital_category == "spo2" & vital_value > 60 & vital_value <= 100)) %>%
+  filter(
+    (vital_category == "spo2" & vital_value > 60 & vital_value <= 100) |
+    (vital_category == "map" & vital_value > 0 & vital_value <= 300)
+  ) %>%
   filter(recorded_dttm >= window_start & recorded_dttm <= window_end) %>%
   rename(recorded_dttm_vitals = recorded_dttm) %>% 
   collect()
@@ -248,7 +253,7 @@ final_combined <- combined_long %>%
   arrange(hospitalization_id, event_time)
 
 # Add in location by applying location_category based on in_dttm, out_dttm, and event_time. 
-# I.e. if event_time falls in between in_dttm and out_dttm, then location_category should be in that row.
+# i.e. if event_time falls in between in_dttm and out_dttm, then location_category should be in that row.
 
 clif_adt <- tbl(con, "clif_adt") %>% collect()
 
@@ -283,10 +288,20 @@ First, create a time variable called `window_hour` which is negative when `event
 
 ```{r message = FALSE, warning=FALSE}
 
+# Cleaning up and adding additional needed variables
 final_data <- as.data.frame(final_data)
 final_data <- final_data %>%
   mutate(variable_name = if_else(source == "resp", 
                                  "fio2_approx", variable_name))
+
+# Add in_hospital_mortality from data df
+mortality_ids <- data %>%
+  select(hospitalization_id, in_hospital_mortality) %>%
+  distinct()
+
+final_data <- final_data %>%
+  left_join(mortality_ids, by = "hospitalization_id")
+
 final_data <- final_data %>%
   mutate(event_time = as.POSIXct(event_time),
          life_support_start = as.POSIXct(life_support_start),
@@ -323,6 +338,12 @@ location_intervals <- sample_data %>%
 create_patient_plots <- function(data, hospitalization_id) {
   patient_data <- data %>%
     filter(hospitalization_id == !!hospitalization_id)
+  
+  most_common_reason <- patient_data %>%
+  count(life_support_reason) %>%
+  arrange(desc(n)) %>%
+  slice(1) %>%
+  pull(life_support_reason)
 
   life_support_window_hour <- unique(
     patient_data$window_hour[which(patient_data$event_time == unique(patient_data$life_support_start))]
@@ -340,15 +361,15 @@ create_patient_plots <- function(data, hospitalization_id) {
     distinct() %>%
     mutate(
       xmin = window_hour,
-      xmax = lead(window_hour, default = max(long_data$window_hour, na.rm = TRUE) + 1)
-    ) %>%
+      xmax = lead(window_hour, default =
+                    max(long_data$window_hour, na.rm = TRUE) + 1)) %>%
     select(location_category, xmin, xmax)
 
   plots <- long_data %>%
     split(.$variable) %>%
     map(function(.x) {
       max_y <- max(.x$value, na.rm = TRUE)
-      label_y <- max_y - 0.1 * abs(max_y)
+      label_y <- min(max_y * 0.95, max_y - 0.1 * abs(max_y))
       ggplot(.x, aes(x = window_hour, y = value)) +
         geom_rect(
           data = location_intervals,
@@ -362,7 +383,7 @@ create_patient_plots <- function(data, hospitalization_id) {
           "text",
           x = life_support_window_hour,
           y = label_y,
-          label = "Life Support Start",
+          label = most_common_reason,
           color = "red",
           angle = 90,
           vjust = -0.5,
@@ -370,6 +391,7 @@ create_patient_plots <- function(data, hospitalization_id) {
           size = 3,
           fontface = "bold"
         ) +
+        scale_y_continuous(expand = expansion(mult = c(0.05, 0.15))) +
         labs(
           title = paste("Hospitalization", hospitalization_id, "-", unique(.x$variable)),
           x = "Window Hour", y = "Value") +
@@ -413,214 +435,147 @@ renderPlot({
 renderDT({
   req(input$Hospitalization)
   filtered <- sample_data %>% filter(hospitalization_id == input$Hospitalization)
-  
+  max_device_filled <- max(filtered$device_filled, na.rm = TRUE)
+  if (is.infinite(max_device_filled)) {
+    max_device_filled <- NA
+  }
+  # Summarize statistics for each variable_name
   summary_df <- filtered %>%
-    summarise(across(all_of(plot_vars), list(
-      mean = ~mean(.x, na.rm = TRUE),
-      median = ~median(.x, na.rm = TRUE),
-      sd = ~sd(.x, na.rm = TRUE),
-      iqr = ~IQR(.x, na.rm = TRUE),
-      min = ~min(.x, na.rm = TRUE),
-      max = ~max(.x, na.rm = TRUE)
-    )))
-  
-  # Use regex: (.*)_(mean|median|sd|iqr|min|max)\$ to split at the LAST underscore
-  summary_df <- summary_df %>%
-    pivot_longer(
-      everything(),
-      names_to = c("Variable", "Statistic"),
-      names_pattern = "^(.*)_([^_]*)$",
-      values_to = "Value"
+    group_by(variable_name) %>%
+    summarise(
+      mean = mean(value, na.rm = TRUE),
+      median = median(value, na.rm = TRUE),
+      sd = sd(value, na.rm = TRUE),
+      iqr = IQR(value, na.rm = TRUE),
+      min = min(value, na.rm = TRUE),
+      max = max(value, na.rm = TRUE)
     ) %>%
-    mutate(Value = round(as.numeric(Value),2)) %>% 
-    pivot_wider(names_from = "Statistic", values_from = "Value") %>%
-    arrange(Variable)
+    ungroup() %>%
+    mutate(across(where(is.numeric), ~round(.x, 2))) %>%
+    arrange(variable_name)
   
   datatable(
     summary_df,
-    caption = paste("Summary Table for Hospitalization ID:", input$Hospitalization),
+    caption = paste0("Summary Table for Hospitalization ID: ",
+                     input$Hospitalization, 
+                     " | Most Utilized Device: ", max_device_filled),
     rownames = FALSE,
     options = list(pageLength = nrow(summary_df))
   )
 })
 ```
 
-# Table 1 Creation
+# Histograms and Device Filled Chart
 
-```{r eval = FALSE}
-library(dplyr)
-library(tidyr)
+```{r histograms, echo = FALSE}
+vars <- unique(final_data$variable_name)
 
-data <- data %>%
-  mutate(mortality_group = ifelse(in_hospital_mortality == 1, "In-Hospital Mortality", "Survived"))
+# Create a named list of histogram plots
+histogram_list <- map(vars, function(var) {
+  ggplot(final_data %>% filter(variable_name == var), aes(x = value)) +
+    geom_histogram(aes(y = after_stat(count / sum(count) * 100)), bins = 30, fill = "#2c7fb8", color = "white") +
+    labs(
+      title = paste("Histogram of", var),
+      x = var,
+      y = "Percent"
+    ) +
+    theme_minimal()
+})
+names(histogram_list) <- vars
 
-# Helper to format counts
-format_count <- function(counts) {
-  pivot_wider(counts, names_from = mortality_group, values_from = value)
-}
+# Device filled bar chart
+device_filled_pct <- final_data %>%
+  filter(!is.na(device_filled)) %>%
+  count(device_filled) %>%
+  mutate(percent = 100 * n / sum(n)) %>%
+  arrange(desc(percent)) %>%
+  mutate(device_filled = factor(device_filled, levels = device_filled)) # order factor by percent
 
-# Hospital admissions
-hospitalizations <- data %>%
-  group_by(mortality_group) %>%
-  summarise(value = as.character(n_distinct(hospitalization_id)), .groups = "drop") %>%
-  mutate(variable = "Hospital admissions, n") %>%
-  format_count()
+life_support_reason_pct <- final_data %>%
+  count(life_support_reason) %>%
+  mutate(percent = 100 * n / sum(n)) %>%
+  arrange(desc(percent)) %>%
+  mutate(life_support_reason = factor(life_support_reason, levels = life_support_reason)) # order factor by percent
 
-# Patients
-patients <- data %>%
-  group_by(mortality_group) %>%
-  summarise(value = as.character(n_distinct(patient_id)), .groups = "drop") %>%
-  mutate(variable = "Patients, n") %>%
-  format_count()
+reason_chart <- ggplot(life_support_reason_pct, aes(x = life_support_reason, y = percent)) +
+  geom_col(fill = "#2c7fb8") +
+  geom_text(
+    aes(label = sprintf("%.1f%%", percent)),
+    vjust = -0.25,
+    size = 4
+  ) +
+  labs(
+    title = "Life Support Reason: Percent of Total (Sorted)",
+    x = "Life Support Reason",
+    y = "Percent"
+  ) +
+  theme_minimal()
 
-vaso_cols <- c("norepinephrine", "vasopressin", "phenylephrine", "dopamine", 
-               "milrinone", "epinephrine", "dobutamine", "angiotensin")
+device_filled_chart <- ggplot(device_filled_pct, aes(x = device_filled, y = percent)) +
+  geom_col(fill = "#f03b20") +
+  geom_text(
+    aes(label = sprintf("%.1f%%", percent)),
+    vjust = -0.25,
+    size = 4
+  ) +
+  labs(
+    title = "Device Filled: Percent of Total (Sorted)",
+    x = "Device Filled",
+    y = "Percent"
+  ) +
+  theme_minimal()
+```
 
-# 1. Make sure they're numeric
-data[vaso_cols] <- lapply(data[vaso_cols], function(x) as.numeric(as.character(x)))
+# Table 1
 
-# 2. Mark any vasopressor usage per ROW
-data <- data %>%
-  mutate(any_vasopressor = if_any(all_of(vaso_cols), ~ !is.na(.) & . > 0))
+```{r table1}
+vars_of_interest <- c("norepinephrine", "spo2", "gcs_total", "fio2_approx", 
+                      "po2_arterial", "platelet_count", "dobutamine", 
+                      "bilirubin_total", "creatinine", "vasopressin", 
+                      "epinephrine", "phenylephrine", "dopamine", 
+                      "milrinone", "angiotensin", "map")
 
-hospital_stays <- data %>%
-  group_by(hospitalization_id, mortality_group) %>%
+# Get n for each mortality group
+group_counts <- final_data %>%
+  filter(variable_name %in% vars_of_interest, !is.na(value)) %>%
+  distinct(hospitalization_id, in_hospital_mortality) %>%
+  count(in_hospital_mortality) %>%
+  deframe()
+
+# Summary stats
+summary_stats <- final_data %>%
+  filter(variable_name %in% vars_of_interest, !is.na(value)) %>%
+  group_by(variable_name, in_hospital_mortality) %>%
   summarise(
-    # patient id if available:
-    patient_id = first(patient_id),
-    sex_category = first(sex_category),           
-    age_at_admission = first(age_at_admission),   
-    race_category = first(race_category),        
-    device_filled = paste(unique(device_filled[!is.na(device_filled)]), collapse = ";"),
-    any_vasopressor = as.integer(any(
-      rowSums(select(., norepinephrine, vasopressin, phenylephrine, dopamine, milrinone, epinephrine, dobutamine, angiotensin), na.rm = TRUE) > 0
-    )),
+    mean = round(mean(value), 2),
+    sd = round(sd(value), 2),
+    median = round(median(value), 2),
     .groups = "drop"
+  ) %>%
+  mutate(
+    summary = paste0(mean, " (", sd, "), median: ", median)
+  ) %>%
+  select(variable_name, in_hospital_mortality, summary) %>%
+  pivot_wider(
+    names_from = in_hospital_mortality,
+    values_from = summary,
+    names_prefix = "mortality_"
   )
 
-female <- hospital_stays %>%
-  group_by(mortality_group) %>%
-  summarise(
-    n_total = n(),
-    n_female = sum(sex_category == "Female", na.rm = TRUE),
-    pct = round(100 * n_female / n_total, 1),
-    value = paste0(n_female, " (", pct, "%)")
+# Build and display table
+table1 <- summary_stats %>%
+  rename(`Variable` = variable_name,
+         !!paste0("Survivors (n = ", group_counts["0"], ")") := mortality_0,
+         !!paste0("Non-Survivors (n = ", group_counts["1"], ")") := mortality_1) %>%
+  gt(rowname_col = "Variable") %>%
+  tab_header(
+    title = "Table 1: Summary Statistics by In-Hospital Mortality"
   ) %>%
-  select(mortality_group, value) %>%
-  mutate(variable = "Female gender, n (%)")
-
-
-# Age
-age <- data %>%
-  group_by(mortality_group) %>%
-  summarise(
-    med = median(age_at_admission, na.rm = TRUE),
-    q1 = quantile(age_at_admission, 0.25, na.rm = TRUE),
-    q3 = quantile(age_at_admission, 0.75, na.rm = TRUE),
-    value = paste0(round(med, 1), " (", round(q1, 1), ", ", round(q3, 1), ")")
+  fmt_missing(
+    columns = everything(),
+    missing_text = "—"
   ) %>%
-  select(mortality_group, value) %>%
-  mutate(variable = "Age, median (25th, 75th)") %>%
-  format_count()
-
-# Race categories
-races <- hospital_stays %>%
-  filter(!is.na(race_category)) %>%
-  group_by(mortality_group, race_category) %>%
-  summarise(n = n(), .groups = "drop") %>%
-  group_by(mortality_group) %>%
-  mutate(pct = round(100 * n / sum(n), 1),
-         value = paste0(n, " (", pct, "%)")) %>%
-  ungroup() %>%
-  mutate(variable = paste0("  ", race_category)) %>%
-  select(variable, mortality_group, value)
-
-# Combine all rows into Table 1
-table1 <- bind_rows(hospitalizations, patients, female, age, races) %>%
-  select(variable, Survived, `In-Hospital Mortality`)
-
-
-# device_type_list: all unique values of device_filled (excluding NAs)
-device_type_list <- unique(na.omit(data$device_filled))
-
-device_tab_list <- lapply(device_type_list, function(dev) {
-  hosp_device <- data %>%
-    group_by(hospitalization_id, mortality_group) %>%
-    summarise(used = any(device_filled == dev, na.rm = TRUE), .groups = "drop")
-  hosp_device %>%
-    group_by(mortality_group) %>%
-    summarise(n = sum(used), pct = round(100 * n / n(), 1), 
-              value = paste0(n, " (", pct, "%)")) %>%
-    mutate(variable = paste0("  Device: ", dev))
-})
-
-device_tab <- bind_rows(device_tab_list)
-
-vaso_tab <- hospital_stays %>%
-  group_by(mortality_group) %>%
-  summarise(
-    n_total = n(),
-    n_vaso = sum(any_vasopressor, na.rm = TRUE),
-    pct = round(100 * n_vaso / n_total, 1),
-    value = paste0(n_vaso, " (", pct, "%)")
-  ) %>%
-  select(mortality_group, value) %>%
-  mutate(variable = "ICU stays requiring any vasopressor, n (%)")
-
-# List of target variables
-vars <- c("fio2_filled", "max_creatinine", "max_bilirubin", "min_plt_count", 
-          "min_map", "min_spo2", "p_f_imputed", "gcs_total")
-
-lab_stats <- lapply(vars, function(var) {
-  # Summarize per hospitalization
-  hosp_lab <- data %>%
-    group_by(hospitalization_id, mortality_group) %>%
-    summarise(
-      all_na = all(is.na(.data[[var]])),                   # TRUE if all NA for this hospitalization
-      lab_median = median(.data[[var]], na.rm = TRUE),
-      lab_q1 = quantile(.data[[var]], 0.25, na.rm = TRUE),
-      lab_q3 = quantile(.data[[var]], 0.75, na.rm = TRUE),
-      .groups = "drop"
-    )
-  
-  # Missingness: per group, how many hospitalizations are missing
-  missing_tab <- hosp_lab %>%
-    group_by(mortality_group) %>%
-    summarise(
-      n_total = n(),
-      n_missing = sum(all_na),
-      missing_pct = round(100 * n_missing / n_total, 1),
-      value = paste0(n_missing, " (", missing_pct, "%)")
-    ) %>%
-    mutate(variable = paste0("  ", var, ", hospitalizations missing measurement, n (%)")) %>%
-    select(variable, mortality_group, value) %>%
-    pivot_wider(names_from = mortality_group, values_from = value)
-  
-  # Lab summaries by group (for hospitalizations with at least one value)
-  non_missing_hosp <- hosp_lab %>% filter(!all_na)
-  summary_tab <- non_missing_hosp %>%
-    group_by(mortality_group) %>%
-    summarise(
-      med = median(lab_median, na.rm = TRUE),
-      q1 = median(lab_q1, na.rm = TRUE),
-      q3 = median(lab_q3, na.rm = TRUE),
-      formatted = paste0(round(med, 2), " (", round(q1, 2), ", ", round(q3, 2), ")")
-    ) %>%
-    mutate(variable = paste0("  ", var, ", median (25th, 75th)")) %>%
-    select(variable, mortality_group, formatted) %>%
-    pivot_wider(names_from = mortality_group, values_from = formatted)
-  
-  # Combine both
-  bind_rows(summary_tab, missing_tab)
-}) %>%
-  bind_rows()
-
-
-
-# Display
-table1_extended <- bind_rows(table1, device_tab, vaso_tab, lab_stats) %>%
-  select(variable, Survived, `In-Hospital Mortality`)
-
-knitr::kable(table1_extended, 
-             caption = "Table 1. Patient Characteristics by In-Hospital Mortality")
+  tab_options(table.font.size = 12)
 ```
+
+# 
