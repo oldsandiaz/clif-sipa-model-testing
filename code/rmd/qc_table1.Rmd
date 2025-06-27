@@ -529,53 +529,238 @@ device_filled_chart <- ggplot(device_filled_pct, aes(x = device_filled, y = perc
 # Table 1
 
 ```{r table1}
-vars_of_interest <- c("norepinephrine", "spo2", "gcs_total", "fio2_approx", 
-                      "po2_arterial", "platelet_count", "dobutamine", 
-                      "bilirubin_total", "creatinine", "vasopressin", 
-                      "epinephrine", "phenylephrine", "dopamine", 
-                      "milrinone", "angiotensin", "map")
+library(dplyr)
+library(tidyr)
+library(kableExtra)
+library(stringr)
 
-# Get n for each mortality group
-group_counts <- final_data %>%
-  filter(variable_name %in% vars_of_interest, !is.na(value)) %>%
-  distinct(hospitalization_id, in_hospital_mortality) %>%
-  count(in_hospital_mortality) %>%
-  deframe()
+# Helper for median (IQR)
+med_iqr <- function(x) {
+  x <- x[!is.na(x)]
+  if (length(x) == 0) return(NA)
+  paste0(formatC(median(x), digits=1, format="f"),
+         " (", 
+         formatC(quantile(x, 0.25), digits=1, format="f"), ", ",
+         formatC(quantile(x, 0.75), digits=1, format="f"), ")")
+}
 
-# Summary stats
-summary_stats <- final_data %>%
-  filter(variable_name %in% vars_of_interest, !is.na(value)) %>%
-  group_by(variable_name, in_hospital_mortality) %>%
+# Summarize to hospitalization_id (ICU encounter) level
+data_summary <- data %>%
+  group_by(hospitalization_id) %>%
   summarise(
-    mean = round(mean(value), 2),
-    sd = round(sd(value), 2),
-    median = round(median(value), 2),
-    .groups = "drop"
+    patient_id = first(patient_id),
+    in_hospital_mortality = first(in_hospital_mortality),
+    sex_category = first(sex_category),
+    race_category = first(race_category),
+    ethnicity_category = first(ethnicity_category),
+    age_at_admission = first(age_at_admission),
+    p_f_imputed = median(p_f_imputed, na.rm = TRUE),
+    s_f = median(s_f, na.rm = TRUE),
+    min_plt_count = median(min_plt_count, na.rm = TRUE),
+    max_bilirubin = median(max_bilirubin, na.rm = TRUE),
+    min_map = median(min_map, na.rm = TRUE),
+    dobutamine = median(dobutamine, na.rm = TRUE),
+    dopamine = median(dopamine, na.rm = TRUE),
+    norepinephrine = median(norepinephrine, na.rm = TRUE),
+    gcs_total = median(gcs_total, na.rm = TRUE),
+    max_creatinine = median(max_creatinine, na.rm = TRUE)
   ) %>%
-  mutate(
-    summary = paste0(mean, " (", sd, "), median: ", median)
-  ) %>%
-  select(variable_name, in_hospital_mortality, summary) %>%
-  pivot_wider(
-    names_from = in_hospital_mortality,
-    values_from = summary,
-    names_prefix = "mortality_"
+  ungroup() %>%
+  mutate(Survival = ifelse(in_hospital_mortality == 0, "Survivor", "Non-Survivor"))
+
+# Patient-level summary for demographics and survival
+patient_summary <- data_summary %>%
+  group_by(patient_id) %>%
+  summarise(
+    race_category = first(race_category),
+    ethnicity_category = first(ethnicity_category),
+    sex_category = first(sex_category),
+    Survival = ifelse(any(in_hospital_mortality == 1), "Non-Survivor", "Survivor")
   )
 
-# Build and display table
-table1 <- summary_stats %>%
-  rename(`Variable` = variable_name,
-         !!paste0("Survivors (n = ", group_counts["0"], ")") := mortality_0,
-         !!paste0("Non-Survivors (n = ", group_counts["1"], ")") := mortality_1) %>%
-  gt(rowname_col = "Variable") %>%
-  tab_header(
-    title = "Table 1: Summary Statistics by In-Hospital Mortality"
-  ) %>%
-  fmt_missing(
-    columns = everything(),
-    missing_text = "—"
-  ) %>%
-  tab_options(table.font.size = 12)
-```
+# Life Support Reason table: one per encounter, from time of support start
+ls_reason_lookup <- data %>%
+  filter(life_support_start == meas_dttm) %>%
+  select(hospitalization_id, life_support_reason) %>%
+  distinct(hospitalization_id, .keep_all = TRUE) %>%
+  left_join(data_summary %>% select(hospitalization_id, Survival), by = "hospitalization_id")
 
-# 
+# Define new variable display names
+var_display_names <- list(
+  "p_f_imputed" = "PaO2/FiO2 (median, IQR)",
+  "s_f" = "SpO2/FiO2 (median, IQR)",
+  "min_plt_count" = "Platelet Count (median, IQR)",
+  "max_bilirubin" = "Bilirubin (median, IQR)",
+  "min_map" = "Mean Arterial Pressure (median, IQR)",
+  "dobutamine" = "Dobutamine (median, IQR)",
+  "dopamine" = "Dopamine (median, IQR)",
+  "norepinephrine" = "Norepinephrine (median, IQR)",
+  "gcs_total" = "Glasgow Coma Scale (median, IQR)",
+  "max_creatinine" = "Creatinine (median, IQR)"
+)
+
+table1 <- list()
+
+# Number of ICU Encounters (N)
+icu_encounters <- data_summary %>%
+  count(Survival)
+table1[["ICU Encounters (N)"]] <- setNames(icu_encounters$n, icu_encounters$Survival)
+
+# Number of Patients (N)
+n_patients <- patient_summary %>%
+  count(Survival)
+table1[["Patients (N)"]] <- setNames(n_patients$n, n_patients$Survival)
+
+# Sex (N, % female) at patient level
+sex_pat <- patient_summary %>%
+  group_by(Survival) %>%
+  summarise(
+    N_female = sum(sex_category == "Female", na.rm = TRUE),
+    Percent_female = 100 * mean(sex_category == "Female", na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(Sex = paste0(N_female, " (", formatC(Percent_female, digits=1, format="f"), "%)"))
+table1[["Sex (N, % Female)"]] <- setNames(sex_pat$Sex, sex_pat$Survival)
+
+# Age (median, IQR) -- at encounter level, placed after Sex
+age <- data_summary %>%
+  group_by(Survival) %>%
+  summarise(stat = med_iqr(age_at_admission), .groups = "drop")
+table1[["Age (median, IQR)"]] <- setNames(
+  c(ifelse("Survivor" %in% age$Survival, age$stat[age$Survival == "Survivor"], ""),
+    ifelse("Non-Survivor" %in% age$Survival, age$stat[age$Survival == "Non-Survivor"], "")),
+  c("Survivor", "Non-Survivor")
+)
+
+# Blank Race header row
+table1[["Race (N, %)"]] <- c("", "")
+
+race_levels <- c("White", "Asian", "Native Hawaiian or Other Pacific Islander", 
+                 "Black or African American", "Unknown", "Other", "American Indian or Alaska Native")
+race_tab <- patient_summary %>%
+  filter(race_category %in% race_levels) %>%
+  group_by(Survival, race_category) %>%
+  summarise(N = n(), .groups = "drop") %>%
+  group_by(Survival) %>%
+  mutate(Total = sum(N),
+         Percent = 100 * N / Total,
+         Race = paste0(N, " (", formatC(Percent, digits=1, format="f"), "%)")) %>%
+  ungroup() %>%
+  select(Survival, race_category, Race) %>%
+  pivot_wider(names_from = Survival, values_from = Race) %>%
+  rename(Variable = race_category)
+
+for (i in seq_along(race_levels)) {
+  row <- race_tab[race_tab$Variable == race_levels[i],]
+  # Just the formatted value, not the variable name
+  table1[[paste0("  ", race_levels[i])]] <- setNames(
+    c(ifelse("Survivor" %in% names(row), row[["Survivor"]], ""),
+      ifelse("Non-Survivor" %in% names(row), row[["Non-Survivor"]], "")),
+    c("Survivor", "Non-Survivor")
+  )
+}
+
+# Blank Ethnicity header row
+table1[["Ethnicity (N, %)"]] <- c("", "")
+ethnicity_levels <- c("Hispanic", "Non-Hispanic", "Unknown")
+eth_tab <- patient_summary %>%
+  filter(ethnicity_category %in% ethnicity_levels) %>%
+  group_by(Survival, ethnicity_category) %>%
+  summarise(N = n(), .groups = "drop") %>%
+  group_by(Survival) %>%
+  mutate(Total = sum(N),
+         Percent = 100 * N / Total,
+         Eth = paste0(N, " (", formatC(Percent, digits=1, format="f"), "%)")) %>%
+  ungroup() %>%
+  select(Survival, ethnicity_category, Eth) %>%
+  pivot_wider(names_from = Survival, values_from = Eth) %>%
+  rename(Variable = ethnicity_category)
+
+for (i in seq_along(ethnicity_levels)) {
+  row <- eth_tab[eth_tab$Variable == ethnicity_levels[i],]
+  table1[[paste0("  ", ethnicity_levels[i])]] <- setNames(
+    c(ifelse("Survivor" %in% names(row), row[["Survivor"]], ""),
+      ifelse("Non-Survivor" %in% names(row), row[["Non-Survivor"]], "")),
+    c("Survivor", "Non-Survivor")
+  )
+}
+
+# Numeric variables (median, IQR) with new names (still at encounter level)
+numeric_vars <- c("p_f_imputed", "s_f", "min_plt_count", "max_bilirubin", "min_map",
+                  "dobutamine", "dopamine", "norepinephrine", "gcs_total", "max_creatinine")
+for (v in numeric_vars) {
+  res <- data_summary %>%
+    group_by(Survival) %>%
+    summarise(stat = med_iqr(.data[[v]]), .groups = "drop")
+  display_name <- var_display_names[[v]]
+  table1[[display_name]] <- setNames(
+    c(ifelse("Survivor" %in% res$Survival, res$stat[res$Survival == "Survivor"], ""),
+      ifelse("Non-Survivor" %in% res$Survival, res$stat[res$Survival == "Non-Survivor"], "")),
+    c("Survivor", "Non-Survivor")
+  )
+}
+
+# Blank Life Support Reason header row
+table1[["Life Support Reason (N, %)"]] <- c("", "")
+
+lsr_tab <- ls_reason_lookup %>%
+  filter(!is.na(life_support_reason)) %>%
+  group_by(Survival, life_support_reason) %>%
+  summarise(N = n(), .groups = "drop") %>%
+  group_by(Survival) %>%
+  mutate(
+    Percent = 100 * N / sum(N),
+    LS = paste0(N, " (", formatC(Percent, digits=1, format="f"), "%)")
+  ) %>%
+  ungroup() %>%
+  select(Survival, life_support_reason, LS) %>%
+  pivot_wider(names_from = Survival, values_from = LS) %>%
+  rename(Variable = life_support_reason)
+
+ls_levels <- unique(lsr_tab$Variable)
+for (i in seq_along(ls_levels)) {
+  row <- lsr_tab[lsr_tab$Variable == ls_levels[i],]
+  table1[[paste0("  ", ls_levels[i])]] <- setNames(
+    c(ifelse("Survivor" %in% names(row), row[["Survivor"]], ""),
+      ifelse("Non-Survivor" %in% names(row), row[["Non-Survivor"]], "")),
+    c("Survivor", "Non-Survivor")
+  )
+}
+
+# Build the table in the desired order
+desired_order <- c(
+  "ICU Encounters (N)",
+  "Patients (N)",
+  "Sex (N, % Female)",
+  "Age (median, IQR)",
+  "Race (N, %)",
+  paste0("  ", race_levels),
+  "Ethnicity (N, %)",
+  paste0("  ", ethnicity_levels),
+  unname(unlist(var_display_names)),
+  "Life Support Reason (N, %)",
+  paste0("  ", ls_levels)
+)
+
+# Defensive extraction: always return blank if not found or not named
+table1_df <- tibble::tibble(
+  Variable = desired_order,
+  Survivor = sapply(desired_order, function(x) {
+    if (!is.null(table1[[x]]) && "Survivor" %in% names(table1[[x]])) table1[[x]][["Survivor"]] else
+      if (!is.null(table1[[x]]) && length(table1[[x]]) == 2 && all(table1[[x]] == "")) "" else ""
+  }),
+  `Non-Survivor` = sapply(desired_order, function(x) {
+    if (!is.null(table1[[x]]) && "Non-Survivor" %in% names(table1[[x]])) table1[[x]][["Non-Survivor"]] else
+      if (!is.null(table1[[x]]) && length(table1[[x]]) == 2 && all(table1[[x]] == "")) "" else ""
+  })
+)
+
+# Print with kableExtra, indenting sub-rows
+table1_df %>%
+  mutate(
+    Variable = ifelse(str_detect(Variable, "^  "), paste0("&nbsp;&nbsp;", str_trim(Variable)), Variable)
+  ) %>%
+  kable("html", escape = FALSE, col.names = c("Variable", "Survivors", "Non-Survivors")) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"), full_width = FALSE) %>%
+  scroll_box(width = "100%")
+```
