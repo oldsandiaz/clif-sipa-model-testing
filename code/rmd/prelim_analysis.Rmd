@@ -1,0 +1,400 @@
+---
+title: "SIPA Analysis"
+output: html_notebook
+---
+
+# Creating model matrices
+
+Load data.
+
+```{r}
+library(arrow)
+
+# Clear environment
+rm(list = ls())
+# Load data
+data <- read_parquet("/Users/cdiaz/Desktop/SRP/SRP SOFA/output/intermediate/sipa_features.parquet")
+```
+
+Define output vector and input matrix. Input matrices:
+
+1.  SOFA Variables
+2.  SOFA Variables + Age
+3.  SOFA + Age + Elixhauser\*
+
+\*Elixhauser in MIMIC was calculated based on diagnoses at discharge. It is not reflective of the diagnoses at the time of life support start.
+
+## Create Elixhauser score
+
+Loads in `comorbidity` package and `clif_admission_diagnosis` file. Generates comorbidity scores by `diagnosis_code_format` and `diagnostic_code`.
+
+```{r}
+library(comorbidity)
+library(tidyverse)
+admission_diagnosis <- read_parquet("/Users/cdiaz/Desktop/SRP/SRP SOFA/code/lookup tables/clif_admission_diagnosis.parquet")
+
+# Select the admission_diagnosis rows that are in sofa_age by hospitalization_id
+admission_diagnosis <- admission_diagnosis %>%
+  filter(hospitalization_id %in% data$hospitalization_id)
+
+# Generate Elixhauser dataframes by ICD code to compute scores
+admission_diagnosis_icd9 <- admission_diagnosis %>%
+  select(hospitalization_id, diagnostic_code, diagnosis_code_format) %>%
+  filter(diagnosis_code_format == "icd9")
+
+# Create Elixhauser matrix using ICD-9
+elixhauser_df_icd9 <- comorbidity(
+  admission_diagnosis_icd9,
+  id = "hospitalization_id",
+  code = "diagnostic_code",
+  map = "elixhauser_icd9_quan",
+  assign0 = TRUE,
+  tidy.codes = TRUE
+)
+
+# Do the same for ICD-10
+admission_diagnosis_icd10 <- admission_diagnosis %>%
+  select(hospitalization_id, diagnostic_code, diagnosis_code_format) %>%
+  filter(diagnosis_code_format == "icd10")
+
+elixhauser_df_icd10 <- comorbidity(
+  admission_diagnosis_icd10,
+  id = "hospitalization_id",
+  code = "diagnostic_code",
+  map = "elixhauser_icd10_quan",
+  assign0 = TRUE,
+  tidy.codes = TRUE
+)
+
+# Combine the two Elixhauser dataframes into one
+elixhauser_df <- bind_rows(elixhauser_df_icd9, elixhauser_df_icd10)
+
+# Generate score column using swiss weights
+elixhauser_score <- elixhauser_df %>%
+  mutate(elixhauser_score = score(elixhauser_df, weights = "swiss", assign0 = FALSE)) %>% 
+  select(hospitalization_id, elixhauser_score) %>% 
+  mutate(hospitalization_id = as.character(hospitalization_id))
+
+# Join the Elixhauser score with data
+data <- data %>%
+  left_join(elixhauser_score, by = "hospitalization_id")
+```
+
+## Create output and input matrices
+
+```{r}
+output <- data$in_hospital_mortality
+sofa_only <- data %>%
+  select(platelets, dobutamine, dopamine, 
+         bilirubin, s_f, creatinine, p_f, 
+         phenylephrine, gcs, map, norepinephrine)
+sofa_age <- data %>% 
+  select(platelets, dobutamine, dopamine, 
+         bilirubin, s_f, creatinine, p_f, 
+         phenylephrine, gcs, 
+         map, norepinephrine, age_at_admission)
+sofa_age_elixhauser <- data %>% 
+  select(platelets, dobutamine, dopamine, 
+         bilirubin, s_f, creatinine, p_f, 
+         phenylephrine, gcs, 
+         map, norepinephrine, age_at_admission,
+         elixhauser_score)
+
+rm(admission_diagnosis)
+rm(admission_diagnosis_icd9)
+rm(admission_diagnosis_icd10)
+rm(elixhauser_df_icd9)
+rm(elixhauser_df_icd10)
+rm(elixhauser_df)
+rm(elixhauser_score)
+```
+
+# Analysis of Variables
+
+Run an elastic net model to see which features are selected across all the variables proposed above.
+
+```{r}
+library(glmnet)
+
+x_glmnet <- as.matrix(sofa_age_elixhauser)
+y_glmnet <- data$in_hospital_mortality
+
+cvfit <- cv.glmnet(x_glmnet, y_glmnet, family = "binomial", type.measure = "auc")
+coef(cvfit, s = "lambda.min")
+```
+
+Run a wrapper algorithm via the `Boruta` package to see which features are selected across all the variables proposed above.
+
+```{r}
+library(Boruta)
+library(mlbench)
+library(caret)
+library(randomForest)
+
+df <- data %>% 
+  select(in_hospital_mortality, platelets, dobutamine, dopamine, 
+         bilirubin, s_f, creatinine, p_f, 
+         phenylephrine, gcs, 
+         map, norepinephrine, age_at_admission,
+         elixhauser_score)
+
+boruta <- Boruta(in_hospital_mortality ~ ., data = df, doTrace = 2, maxRuns = 500)
+plot(boruta, las = 2, cex.axis = 0.7)
+```
+
+# Logistic Regression
+
+## Model 1: SOFA Only
+
+```{r}
+library(caret)
+
+# Set output as factor
+output <- data$in_hospital_mortality
+output <- as.factor(output)
+output <- factor(output, levels = c(0, 1), labels = c("Alive", "Dead"))
+
+# Replace NAs with 0s
+sofa_only[is.na(sofa_only)] <- 0
+
+# Define model matrix
+model_df1 <- data.frame(sofa_only, output = output)
+
+# 5-fold cross validation for training
+cv_control <- trainControl(
+  method = "cv",
+  number = 5,
+  classProbs = TRUE,
+  summaryFunction = twoClassSummary,
+)
+
+# train
+set.seed(42) # the meaning of life
+model1 <- train(
+  output ~ .,
+  data = model_df1,
+  method = "glm",
+  family = binomial(),
+  trControl = cv_control,
+  metric = "ROC"
+)
+
+print(model1)
+```
+
+## Model 2: SOFA + Age
+
+```{r}
+library(caret)
+
+# Set output as factor
+output <- data$in_hospital_mortality
+output <- as.factor(output)
+output <- factor(output, levels = c(0, 1), labels = c("Alive", "Dead"))
+
+# Replace NAs with 0s
+sofa_age[is.na(sofa_age)] <- 0
+
+# Define model matrix
+model_df2 <- data.frame(sofa_age, output = output)
+
+# 5-fold cross validation for training
+cv_control <- trainControl(
+  method = "cv",
+  number = 5,
+  classProbs = TRUE,
+  summaryFunction = twoClassSummary,
+)
+
+# train
+set.seed(42) # the meaning of life
+model2 <- train(
+  output ~ .,
+  data = model_df2,
+  method = "glm",
+  family = binomial(),
+  trControl = cv_control,
+  metric = "ROC"
+)
+
+print(model2)
+```
+
+## Model 3: SOFA + Age + Elixhauser
+
+```{r}
+library(caret)
+output <- data$in_hospital_mortality
+output <- as.factor(output)
+output <- factor(output, levels = c(0, 1), labels = c("Alive", "Dead"))
+
+# Replace NAs with 0s
+sofa_age_elixhauser[is.na(sofa_age_elixhauser)] <- 0
+
+# Define model matrix
+model_df3 <- data.frame(sofa_age_elixhauser, output = output)
+
+# 5-fold cross validation for training
+cv_control <- trainControl(
+  method = "cv",
+  number = 5,
+  classProbs = TRUE,
+  summaryFunction = twoClassSummary,
+)
+
+# Train
+set.seed(42) # the meaning of life
+model3 <- train(
+  output ~ .,
+  data = model_df3,
+  method = "glm",
+  family = binomial(),
+  trControl = cv_control,
+  metric = "ROC"
+)
+print(model3)
+```
+
+# Elastic Net
+
+## Model 1: SOFA Only
+
+```{r}
+library(caret)
+
+get_best_result = function(caret_fit) {
+  best = which(rownames(caret_fit$results) == rownames(caret_fit$bestTune))
+  best_result = caret_fit$results[best, ]
+  rownames(best_result) = NULL
+  return(best_result)
+}
+
+set.seed(42) # the meaning of life
+
+# 5-fold cross validation for training
+cv_control <- trainControl(
+  method = "cv",
+  number = 5,
+  classProbs = TRUE,
+  summaryFunction = twoClassSummary,
+)
+
+elnet1 <- train(
+  output ~.,
+  data = model_df1,
+  method = "glmnet",
+  trControl = cv_control,
+  metric = "ROC",
+  tuneLength = 10
+)
+get_best_result(elnet1)
+```
+
+## Model 2: SOFA + Age
+
+```{r}
+set.seed(42) # the meaning of life
+elnet2 <- train(
+  output ~.,
+  data = model_df2,
+  method = "glmnet",
+  trControl = cv_control,
+  metric = "ROC",
+  tuneLength = 10
+)
+get_best_result(elnet2)
+```
+
+## Model 3: SOFA + Age + Elixhauser
+
+```{r}
+set.seed(42) # the meaning of life
+elnet3 <- train(
+  output ~.,
+  data = model_df3,
+  method = "glmnet",
+  trControl = cv_control,
+  metric = "ROC",
+  tuneLength = 10
+)
+get_best_result(elnet3)
+```
+
+# LightGBM
+
+## Model 1: SOFA Only
+
+```{r}
+library(lightgbm)
+library(pROC)
+
+set.seed(42) # the meaning of life
+
+# Convert output to a 1/0 vector
+y <- data$in_hospital_mortality
+
+# Train LightGBM model with SOFA variables only
+dtrain1 <- lgb.Dataset(data = as.matrix(sofa_only), label = y)
+params <- list(
+  objective = "binary",
+  metric = "auc"
+)
+
+cv_results1 <- lgb.cv(
+  params = params,
+  data = dtrain1,
+  nfold = 5,
+  nrounds = 100,
+  stratified = TRUE,
+  eval = "auc",
+  early_stopping_rounds = 10,
+  verbose = 0
+)
+cv_results1$best_score
+```
+
+## Model 2: SOFA + Age
+
+```{r}
+# Train LightGBM model with SOFA variables and age
+dtrain2 <- lgb.Dataset(data = as.matrix(sofa_age), label = y)
+
+params <- list(
+  objective = "binary",
+  metric = "auc"
+)
+
+cv_results2 <- lgb.cv(
+  params = params,
+  data = dtrain2,
+  nfold = 5,
+  nrounds = 100,
+  stratified = TRUE,
+  eval = "auc",
+  early_stopping_rounds = 10,
+  verbose = 0
+)
+cv_results2$best_score
+```
+
+## Model 3: SOFA + Age + Elixhauser
+
+```{r}
+# Train LightGBM model with SOFA variables, age, and Elixhauser score
+dtrain3 <- lgb.Dataset(data = as.matrix(sofa_age_elixhauser), label = y)
+params <- list(
+  objective = "binary",
+  metric = "auc"
+)
+cv_results3 <- lgb.cv(
+  params = params,
+  data = dtrain3,
+  nfold = 5,
+  nrounds = 100,
+  stratified = TRUE,
+  eval = "auc",
+  early_stopping_rounds = 10,
+  verbose = 0
+)
+cv_results3$best_score
+```
