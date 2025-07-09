@@ -119,7 +119,7 @@ data_clean <- data %>%
 final_data <- df_sum_clean %>%
   left_join(data_clean, by = "hospitalization_id")
 
-# Export
+# Export the final data as a parquet 
 write_parquet(final_data, 
                "/Users/cdiaz/Desktop/SRP/SRP SOFA/output/intermediate/sipa_features.parquet")
 
