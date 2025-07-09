@@ -1,10 +1,4 @@
----
-editor_options: 
-  markdown: 
-    wrap: 72
----
-
-# *CLIF Project Title*
+# *Development of an improved in-hospital mortality predictor based on SOFA*
 
 ## CLIF VERSION
 
