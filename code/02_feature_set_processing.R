@@ -123,6 +123,110 @@ data_clean <- data %>%
 final_data <- df_sum_clean %>%
   left_join(data_clean, by = "hospitalization_id")
 
+####################
+### COMPUTE SOFA SCORE FOR EACH HOSPITALIZATION
+####################
+
+# Define the SOFA score calculation function
+compute_sofa_score <- function(row) {
+  
+  # Extract the relevant variables from the row
+  p_f <- row$p_f
+  s_f <- row$s_f
+  platelets <- row$platelets
+  bilirubin <- row$bilirubin
+  map <- row$map
+  dopamine <- row$dopamine
+  dobutamine <- row$dobutamine
+  norepinephrine <- row$norepinephrine
+  epinephrine <- row$epinephrine
+  gcs <- row$gcs
+  creatinine <- row$creatinine
+  
+  # Respiration (PaO2/FiO2 or SaO2/FiO2 ratio)
+  resp <- NA
+  if (!is.na(p_f)) {
+    if (p_f >= 400) 0
+    else if (p_f >= 300) 1
+    else if (p_f >= 200) 2
+    else if (p_f >= 100) 3
+    else 4
+  } else if (!is.na(s_f)) {
+    if (s_f > 301) 0
+    else if (s_f >= 221 && s_f <= 301) 1
+    else if (s_f >= 142 && s_f <= 220) 2
+    else if (s_f >= 67 && s_f <= 141) 3
+    else if (s_f < 67) 4
+  }
+  
+  # Coagulation (platelet count)
+  coag <- if (!is.na(platelets)) {
+    if (platelets >= 150) 0
+    else if (platelets >= 100) 1
+    else if (platelets >= 50) 2
+    else if (platelets >= 20) 3
+    else 4
+  } else {
+    NA
+  }
+  
+  # Liver (bilirubin, mg/dl)
+  liver <- if (!is.na(bilirubin)) {
+    if (bilirubin < 1.2) 0
+    else if (bilirubin < 2.0) 1
+    else if (bilirubin < 6.0) 2
+    else if (bilirubin < 12.0) 3
+    else 4
+  } else {
+    NA
+  }
+  
+  # Cardiovascular
+  cv <- 0
+  # 1: MAP < 70 mmHg
+  if (!is.na(map) && map < 70) cv <- 1
+  # 2: Dopamine <= 5 or any dobutamine
+  if ((!is.na(dopamine) && dopamine > 0 && dopamine <= 5) || (!is.na(dobutamine) && dobutamine > 0)) cv <- 2
+  # 3: Dopamine > 5 or norepinephrine <= 0.1 or epinephrine <= 0.1
+  if ((!is.na(dopamine) && dopamine > 5) ||
+      (!is.na(norepinephrine) && norepinephrine > 0 && norepinephrine <= 0.1) ||
+      (!is.na(epinephrine) && epinephrine > 0 && epinephrine <= 0.1)) cv <- 3
+  # 4: Dopamine > 15 or norepinephrine > 0.1 or epinephrine > 0.1
+  if ((!is.na(dopamine) && dopamine > 15) ||
+      (!is.na(norepinephrine) && norepinephrine > 0.1) ||
+      (!is.na(epinephrine) && epinephrine > 0.1)) cv <- 4
+  
+  # CNS (GCS)
+  cns <- if (!is.na(gcs)) {
+    if (gcs == 15) 0
+    else if (gcs >= 13) 1
+    else if (gcs >= 10) 2
+    else if (gcs >= 6) 3
+    else 4
+  } else {
+    NA
+  }
+  
+  # Renal (creatinine, mg/dl)
+  renal <- if (!is.na(creatinine)) {
+    if (creatinine < 1.2) 0
+    else if (creatinine < 2.0) 1
+    else if (creatinine < 3.5) 2
+    else if (creatinine < 5.0) 3
+    else 4
+  } else {
+    NA
+  }
+  
+  total_score <- sum(c(resp, coag, liver, cv, cns, renal), na.rm = TRUE)
+  return(total_score)
+}
+
+final_data <- final_data %>%
+  rowwise() %>%
+  mutate(sofa_score = compute_sofa_score(cur_data()))
+  
+
 # Export the final data as a parquet 
 write_parquet(final_data, 
                "/Users/cdiaz/Desktop/SRP/SRP SOFA/output/intermediate/sipa_features.parquet")
