@@ -1,13 +1,17 @@
 ---
 title: "SIPA Analysis"
-output: html_notebook
+author: "Caleb Diaz"
+output: 
+  html_document:
+    code_folding: hide
+    theme: flatly
 ---
 
 # Creating model matrices
 
 Load data.
 
-```{r}
+```{r message=FALSE, warning=FALSE}
 library(arrow)
 
 # Clear environment
@@ -28,7 +32,7 @@ Define output vector and input matrix. Input matrices:
 
 Loads in `comorbidity` package and `clif_admission_diagnosis` file. Generates comorbidity scores by `diagnosis_code_format` and `diagnostic_code`.
 
-```{r}
+```{r message=FALSE, warning=FALSE}
 library(comorbidity)
 library(tidyverse)
 admission_diagnosis <- read_parquet("/Users/cdiaz/Desktop/SRP/SRP SOFA/code/lookup tables/clif_admission_diagnosis.parquet")
@@ -78,28 +82,8 @@ elixhauser_score <- elixhauser_df %>%
 # Join the Elixhauser score with data
 data <- data %>%
   left_join(elixhauser_score, by = "hospitalization_id")
-```
 
-## Create output and input matrices
-
-```{r}
-output <- data$in_hospital_mortality
-sofa_only <- data %>%
-  select(platelets, dobutamine, dopamine, 
-         bilirubin, s_f, creatinine, p_f, 
-         phenylephrine, gcs, map, norepinephrine)
-sofa_age <- data %>% 
-  select(platelets, dobutamine, dopamine, 
-         bilirubin, s_f, creatinine, p_f, 
-         phenylephrine, gcs, 
-         map, norepinephrine, age_at_admission)
-sofa_age_elixhauser <- data %>% 
-  select(platelets, dobutamine, dopamine, 
-         bilirubin, s_f, creatinine, p_f, 
-         phenylephrine, gcs, 
-         map, norepinephrine, age_at_admission,
-         elixhauser_score)
-
+# Clear up memory
 rm(admission_diagnosis)
 rm(admission_diagnosis_icd9)
 rm(admission_diagnosis_icd10)
@@ -109,44 +93,112 @@ rm(elixhauser_df)
 rm(elixhauser_score)
 ```
 
-# Analysis of Variables
+## Create output and input matrices
 
-Run an elastic net model to see which features are selected across all the variables proposed above.
+Two types of input matrices: - Medication doses - Norepinephrine equivalents with dobutamine dummy.
 
-```{r}
-library(glmnet)
+```{r message=FALSE, warning=FALSE}
+output <- data$in_hospital_mortality
 
-x_glmnet <- as.matrix(sofa_age_elixhauser)
-y_glmnet <- data$in_hospital_mortality
+# Add ne_eq and on_dopamine columns to data
 
-cvfit <- cv.glmnet(x_glmnet, y_glmnet, family = "binomial", type.measure = "auc")
-coef(cvfit, s = "lambda.min")
-```
+data <- data %>%
+  mutate(
+    across(where(is.numeric), ~replace_na(.x, 0)),
+    across(where(is.character), ~replace_na(.x, ""))
+  ) %>%
+  mutate(
+    on_dobutamine = ifelse(dobutamine > 0, 1, 0),
+    ne_eq = coalesce(norepinephrine, 0) +
+      coalesce(epinephrine_ne_eq, 0) +
+      coalesce(phenylephrine_ne_eq, 0) * 0.1 +
+      coalesce(dopamine_ne_eq, 0) * 0.01)
 
-Run a wrapper algorithm via the `Boruta` package to see which features are selected across all the variables proposed above.
+# All dosing
+sofa_only <- data %>%
+  select(platelets, dobutamine, dopamine, 
+         bilirubin, s_f, creatinine, p_f, 
+         phenylephrine, gcs, map, norepinephrine, epinephrine)
 
-```{r}
-library(Boruta)
-library(mlbench)
-library(caret)
-library(randomForest)
+# NE equivalents
+sofa_only_ne_eq <- data %>% 
+  select(platelets, on_dobutamine, ne_eq, 
+         bilirubin, s_f, creatinine, p_f, gcs, map) %>% 
+  mutate(across(everything(), ~replace_na(.x, 0)))
+  
 
-df <- data %>% 
-  select(in_hospital_mortality, platelets, dobutamine, dopamine, 
+# All dosing
+sofa_age <- data %>% 
+  select(platelets, dobutamine, dopamine, 
+         bilirubin, s_f, creatinine, p_f, 
+         phenylephrine, gcs, 
+         map, norepinephrine, epinephrine, age_at_admission) %>% 
+  mutate(across(everything(), ~replace_na(.x, 0)))
+
+# NE equivalents
+sofa_age_ne_eq <- data %>% 
+  select(platelets, on_dobutamine, 
+         bilirubin, s_f, creatinine, p_f,  gcs, 
+         map, age_at_admission)
+
+# All dosing
+sofa_age_elixhauser <- data %>% 
+  select(platelets, dobutamine, dopamine, 
          bilirubin, s_f, creatinine, p_f, 
          phenylephrine, gcs, 
          map, norepinephrine, age_at_admission,
          elixhauser_score)
 
-boruta <- Boruta(in_hospital_mortality ~ ., data = df, doTrace = 2, maxRuns = 500)
-plot(boruta, las = 2, cex.axis = 0.7)
+# NE equivalents
+sofa_age_elixhauser_ne_eq <- data %>% 
+  select(platelets, on_dobutamine, ne_eq, 
+         bilirubin, s_f, creatinine, p_f, gcs, 
+         map, age_at_admission,
+         elixhauser_score) %>% 
+  mutate(across(everything(), ~replace_na(.x, 0)))
+
 ```
 
-# Logistic Regression
+# Analysis of Variables
 
-## Model 1: SOFA Only
+Run an elastic net model to see which features are selected across all the variables proposed above.
 
-```{r}
+```{r message=FALSE, warning=FALSE}
+library(glmnet)
+
+x_glmnet <- as.matrix(sofa_age_elixhauser)
+x_ne_eq_glmnet <- as.matrix(sofa_age_elixhauser_ne_eq)
+y_glmnet <- data$in_hospital_mortality
+
+cvfit <- cv.glmnet(x_glmnet, y_glmnet, family = "binomial", type.measure = "auc")
+all_coef <- coef(cvfit, s = "lambda.min")
+
+cvfit_ne_eq <- cv.glmnet(x_ne_eq_glmnet, y_glmnet, family = "binomial", type.measure = "auc")
+all_coef_ne_eq <- coef(cvfit_ne_eq, s = "lambda.min")
+
+print(all_coef)
+print(all_coef_ne_eq)
+```
+
+# Logistic Regression {.tabset}
+
+For each of the three feature sets described above, as well as their medication subtypes, run a logistic regression model with 5-fold cross validation.
+
+## SOFA Score
+```{r message=FALSE, warning=FALSE}
+library(pROC)
+glm_sofa_score <- glm(in_hospital_mortality ~ sofa_score, data = data)
+summary(glm_sofa_score)
+# AUC
+roc_obj_sofa_score <- roc(data$in_hospital_mortality, predict(glm_sofa_score, type = "response"))
+auc(roc_obj_sofa_score)
+```
+
+## Model 1: SOFA Variables Only {.tabset}
+
+### All Meds
+
+```{r message=FALSE}
 library(caret)
 
 # Set output as factor
@@ -182,9 +234,47 @@ model1 <- train(
 print(model1)
 ```
 
-## Model 2: SOFA + Age
+### Norepinephrine Equivalents
 
-```{r}
+```{r message=FALSE}
+library(caret)
+
+# Set output as factor
+output <- data$in_hospital_mortality
+output <- as.factor(output)
+output <- factor(output, levels = c(0, 1), labels = c("Alive", "Dead"))
+
+# Replace NAs with 0s
+sofa_only_ne_eq[is.na(sofa_only_ne_eq)] <- 0
+
+# Define model matrix
+model_df1_ne_eq <- data.frame(sofa_only_ne_eq, output = output)
+
+# 5-fold cross validation for training
+cv_control <- trainControl(
+  method = "cv",
+  number = 5,
+  classProbs = TRUE,
+  summaryFunction = twoClassSummary,
+)
+# train
+set.seed(42) # the meaning of life
+model1_ne_eq <- train(
+  output ~ .,
+  data = model_df1_ne_eq,
+  method = "glm",
+  family = binomial(),
+  trControl = cv_control,
+  metric = "ROC"
+)
+print(model1_ne_eq)
+```
+
+## Model 2: SOFA + Age {.tabset}
+
+### All Meds
+
+```{r message = FALSE}
 library(caret)
 
 # Set output as factor
@@ -220,9 +310,43 @@ model2 <- train(
 print(model2)
 ```
 
-## Model 3: SOFA + Age + Elixhauser
+### Norepinephrine Equivalents
 
-```{r}
+```{r message = FALSE}
+library(caret)
+# Set output as factor
+output <- data$in_hospital_mortality
+output <- as.factor(output)
+output <- factor(output, levels = c(0, 1), labels = c("Alive", "Dead"))
+# Replace NAs with 0s
+sofa_age_ne_eq[is.na(sofa_age_ne_eq)] <- 0
+# Define model matrix
+model_df2_ne_eq <- data.frame(sofa_age_ne_eq, output = output)
+# 5-fold cross validation for training
+cv_control <- trainControl(
+  method = "cv",
+  number = 5,
+  classProbs = TRUE,
+  summaryFunction = twoClassSummary,
+)
+# train
+set.seed(42) # the meaning of life
+model2_ne_eq <- train(
+  output ~ .,
+  data = model_df2_ne_eq,
+  method = "glm",
+  family = binomial(),
+  trControl = cv_control,
+  metric = "ROC"
+)
+print(model2_ne_eq)
+```
+
+## Model 3: SOFA + Age + Elixhauser {.tabset}
+
+### All Meds
+
+```{r message = FALSE}
 library(caret)
 output <- data$in_hospital_mortality
 output <- as.factor(output)
@@ -255,11 +379,191 @@ model3 <- train(
 print(model3)
 ```
 
-# Elastic Net
+### Norepinephrine Equivalents
+
+```{r}
+library(caret)
+# Set output as factor
+output <- data$in_hospital_mortality
+output <- as.factor(output)
+output <- factor(output, levels = c(0, 1), labels = c("Alive", "Dead"))
+
+# Replace NAs with 0s
+sofa_age_elixhauser_ne_eq[is.na(sofa_age_elixhauser_ne_eq)] <- 0
+# Define model matrix
+model_df3_ne_eq <- data.frame(sofa_age_elixhauser_ne_eq, output = output)
+# 5-fold cross validation for training
+cv_control <- trainControl(
+  method = "cv",
+  number = 5,
+  classProbs = TRUE,
+  summaryFunction = twoClassSummary,
+)
+# Train
+set.seed(42) # the meaning of life
+model3_ne_eq <- train(
+  output ~ .,
+  data = model_df3_ne_eq,
+  method = "glm",
+  family = binomial(),
+  trControl = cv_control,
+  metric = "ROC"
+)
+print(model3_ne_eq)
+```
+
+# Generalized Additive Models {.tabset}
+
+Just using all meds, and not norepinephrine equivalents, constructs a set of GAMs for each of the three feature sets described above. Uses splines.
 
 ## Model 1: SOFA Only
 
-```{r}
+```{r message = FALSE, warning = FALSE}
+library(mgcv)
+library(caret)
+library(purrr)
+library(pROC)
+library(dplyr)
+
+set.seed(42)
+folds <- createFolds(model_df1$output, k = 5)
+
+# Collect both AUCs and predictions in one go
+results1 <- map(folds, function(test_idx) {
+  train_idx <- setdiff(seq_len(nrow(model_df1)), test_idx)
+  train_data <- model_df1[train_idx, ]
+  test_data <- model_df1[test_idx, ]
+  
+  gam_fit <- gam(
+    output ~ s(platelets) + s(dobutamine) + s(dopamine) +
+      s(bilirubin) + s(s_f) + s(creatinine) + s(p_f) +
+      s(phenylephrine) + s(gcs) + s(map) + s(norepinephrine),
+    data = train_data,
+    family = binomial()
+  )
+  
+  # Predict on test fold
+  pred <- predict(gam_fit, test_data, type = "response")
+  auc <- roc(response = test_data$output, predictor = pred)$auc
+  
+  # Return both AUC and predictions
+  list(
+    auc = auc,
+    preds = data.frame(
+      true_label = test_data$output,
+      pred_prob = pred))
+})
+
+# Average AUC
+mean_auc <- mean(map_dbl(results1, "auc"))
+
+# Combine all out-of-fold predictions
+all_preds <- bind_rows(map(results1, "preds"))
+
+# Print mean AUC and head of predictions
+print(mean_auc)
+```
+
+## Model 2: SOFA + Age
+
+```{r message = FALSE, warning = FALSE}
+library(mgcv)
+library(caret)
+library(purrr)
+library(pROC)
+library(dplyr)
+
+# Create 5-folds
+set.seed(42)
+folds <- createFolds(model_df2$output, k = 5)
+
+results2 <- map(folds, function(test_idx) {
+  train_idx <- setdiff(seq_len(nrow(model_df2)), test_idx)
+  train_data <- model_df2[train_idx, ]
+  test_data <- model_df2[test_idx, ]
+  
+  gam_fit <- gam(
+    output ~ s(platelets) + s(dobutamine) + s(dopamine) +
+      s(bilirubin) + s(s_f) + s(creatinine) + s(p_f) +
+      s(phenylephrine) + s(gcs) + s(map) + s(norepinephrine) + s(age_at_admission),
+    data = train_data,
+    family = binomial()
+  )
+  
+  # Predict on test fold
+  pred <- predict(gam_fit, test_data, type = "response")
+  auc <- roc(response = test_data$output, predictor = pred)$auc
+  
+  # Return both AUC and predictions
+  list(
+    auc = auc,
+    preds = data.frame(
+      true_label = test_data$output,
+      pred_prob = pred))
+})
+
+# Average AUC
+mean_auc2 <- mean(map_dbl(results2, "auc"))
+# Combine all out-of-fold predictions
+all_preds2 <- bind_rows(map(results2, "preds"))
+# Print mean AUC and head of predictions
+print(mean_auc2)
+
+```
+
+## Model 3: SOFA + Age + Elixhauser
+
+```{r message = FALSE, warning = FALSE}
+library(mgcv)
+library(caret)
+library(purrr)
+library(pROC)
+library(dplyr)
+
+# Create 5-folds
+set.seed(42)
+folds <- createFolds(model_df3$output, k = 5)
+
+results3 <- map(folds, function(test_idx) {
+  train_idx <- setdiff(seq_len(nrow(model_df3)), test_idx)
+  train_data <- model_df3[train_idx, ]
+  test_data <- model_df3[test_idx, ]
+  
+  gam_fit <- gam(
+    output ~ s(platelets) + s(dobutamine) + s(dopamine) +
+      s(bilirubin) + s(s_f) + s(creatinine) + s(p_f) +
+      s(phenylephrine) + s(gcs) + s(map) + s(norepinephrine) + s(age_at_admission) + s(elixhauser_score),
+    data = train_data,
+    family = binomial()
+  )
+  
+  # Predict on test fold
+  pred <- predict(gam_fit, test_data, type = "response")
+  auc <- roc(response = test_data$output, predictor = pred)$auc
+  
+  # Return both AUC and predictions
+  list(
+    auc = auc,
+    preds = data.frame(
+      true_label = test_data$output,
+      pred_prob = pred))
+})
+# Average AUC
+mean_auc3 <- mean(map_dbl(results3, "auc"))
+# Combine all out-of-fold predictions
+all_preds3 <- bind_rows(map(results3, "preds"))
+# Print mean AUC
+print(mean_auc3)
+
+```
+
+# Elastic Net {.tabset}
+
+## Model 1: SOFA Only {.tabset}
+
+### All Meds
+
+```{r message = FALSE, warning = FALSE}
 library(caret)
 
 get_best_result = function(caret_fit) {
@@ -290,9 +594,26 @@ elnet1 <- train(
 get_best_result(elnet1)
 ```
 
-## Model 2: SOFA + Age
+### Norepinephrine Equivalents
 
-```{r}
+```{r message = FALSE}
+set.seed(42) # the meaning of life
+elnet1_ne_eq <- train(
+  output ~.,
+  data = model_df1_ne_eq,
+  method = "glmnet",
+  trControl = cv_control,
+  metric = "ROC",
+  tuneLength = 10
+)
+get_best_result(elnet1_ne_eq)
+```
+
+## Model 2: SOFA + Age {.tabset}
+
+### All Meds
+
+```{r message = FALSE}
 set.seed(42) # the meaning of life
 elnet2 <- train(
   output ~.,
@@ -305,9 +626,26 @@ elnet2 <- train(
 get_best_result(elnet2)
 ```
 
-## Model 3: SOFA + Age + Elixhauser
+### Norepinephrine Equivalents
 
-```{r}
+```{r message = FALSE}
+set.seed(42) # the meaning of life
+elnet2_ne_eq <- train(
+  output ~.,
+  data = model_df2_ne_eq,
+  method = "glmnet",
+  trControl = cv_control,
+  metric = "ROC",
+  tuneLength = 10
+)
+get_best_result(elnet2_ne_eq)
+```
+
+## Model 3: SOFA + Age + Elixhauser {.tabset}
+
+### All Meds
+
+```{r message = FALSE}
 set.seed(42) # the meaning of life
 elnet3 <- train(
   output ~.,
@@ -320,11 +658,28 @@ elnet3 <- train(
 get_best_result(elnet3)
 ```
 
-# LightGBM
+### Norepinephrine Equivalents
 
-## Model 1: SOFA Only
+```{r message = FALSE}
+set.seed(42) # the meaning of life
+elnet3_ne_eq <- train(
+  output ~.,
+  data = model_df3_ne_eq,
+  method = "glmnet",
+  trControl = cv_control,
+  metric = "ROC",
+  tuneLength = 10
+)
+get_best_result(elnet3_ne_eq)
+```
 
-```{r}
+# LightGBM {.tabset}
+
+## Model 1: SOFA Only {.tabset}
+
+### All Meds
+
+```{r message = FALSE}
 library(lightgbm)
 library(pROC)
 
@@ -350,12 +705,46 @@ cv_results1 <- lgb.cv(
   early_stopping_rounds = 10,
   verbose = 0
 )
+
+best_iter <- cv_results1$best_iter
 cv_results1$best_score
+
+# train
+gbm_model1 <- lgb.train(
+  params = params,
+  data = dtrain1,
+  nrounds = best_iter
+)
+
 ```
 
-## Model 2: SOFA + Age
+### Norepinephrine Equivalents
 
-```{r}
+```{r message = FALSE}
+# Train LightGBM model with SOFA variables and norepinephrine equivalents
+dtrain1_ne_eq <- lgb.Dataset(data = as.matrix(sofa_only_ne_eq), label = y)
+params <- list(
+  objective = "binary",
+  metric = "auc"
+)
+cv_results1_ne_eq <- lgb.cv(
+  params = params,
+  data = dtrain1_ne_eq,
+  nfold = 5,
+  nrounds = 100,
+  stratified = TRUE,
+  eval = "auc",
+  early_stopping_rounds = 10,
+  verbose = 0
+)
+cv_results1_ne_eq$best_score
+```
+
+## Model 2: SOFA + Age {.tabset}
+
+### All Meds
+
+```{r message = FALSE}
 # Train LightGBM model with SOFA variables and age
 dtrain2 <- lgb.Dataset(data = as.matrix(sofa_age), label = y)
 
@@ -377,9 +766,33 @@ cv_results2 <- lgb.cv(
 cv_results2$best_score
 ```
 
-## Model 3: SOFA + Age + Elixhauser
+### Norepinephrine Equivalents
 
-```{r}
+```{r message = FALSE}
+# Train LightGBM model with SOFA variables, age, and norepinephrine equivalents
+dtrain2_ne_eq <- lgb.Dataset(data = as.matrix(sofa_age_ne_eq), label = y)
+params <- list(
+  objective = "binary",
+  metric = "auc"
+)
+cv_results2_ne_eq <- lgb.cv(
+  params = params,
+  data = dtrain2_ne_eq,
+  nfold = 5,
+  nrounds = 100,
+  stratified = TRUE,
+  eval = "auc",
+  early_stopping_rounds = 10,
+  verbose = 0
+)
+cv_results2_ne_eq$best_score
+```
+
+## Model 3: SOFA + Age + Elixhauser {.tabset}
+
+### All Meds
+
+```{r message = FALSE}
 # Train LightGBM model with SOFA variables, age, and Elixhauser score
 dtrain3 <- lgb.Dataset(data = as.matrix(sofa_age_elixhauser), label = y)
 params <- list(
@@ -398,3 +811,84 @@ cv_results3 <- lgb.cv(
 )
 cv_results3$best_score
 ```
+
+### Norepinephrine Equivalents
+
+```{r message = FALSE}
+# Train LightGBM model with SOFA variables, age, Elixhauser score, and norepinephrine equivalents
+dtrain3_ne_eq <- lgb.Dataset(data = as.matrix(sofa_age_elixhauser_ne_eq), label = y)
+params <- list(
+  objective = "binary",
+  metric = "auc"
+)
+cv_results3_ne_eq <- lgb.cv(
+  params = params,
+  data = dtrain3_ne_eq,
+  nfold = 5,
+  nrounds = 100,
+  stratified = TRUE,
+  eval = "auc",
+  early_stopping_rounds = 10,
+  verbose = 0
+)
+cv_results3_ne_eq$best_score
+```
+
+# Summary AUC Tables for All Meds Models {.tabset}
+
+Summary tables of the results from the models above. I only selected the All Meds models.
+
+```{r message=TRUE, warning=TRUE, include=FALSE}
+library(knitr)
+library(pROC)
+library(PRROC)
+library(ggplot2)
+```
+
+## SOFA Only
+
+```{r messages = FALSE, warning = FALSE}
+
+# Table of AUCs
+sofa_only_results <- data.frame(
+  Model = c("Logistic Regression", "GAM", "Elastic Net", "LightGBM"),
+  AUC = c(
+    get_best_result(model1)$ROC,
+    mean(unlist(results1)),
+    get_best_result(elnet1)$ROC,
+    cv_results1$best_score
+  ))
+kable(sofa_only_results, caption = "SOFA Only Model AUC")
+```
+
+## SOFA + Age
+
+```{r}
+sofa_age_results <- data.frame(
+  Model = c("Logistic Regression", "GAM", "Elastic Net", "LightGBM"),
+  AUC = c(
+    get_best_result(model2)$ROC,
+    mean(unlist(results2)),
+    get_best_result(elnet2)$ROC,
+    cv_results2$best_score
+  )
+)
+kable(sofa_age_results, caption = "SOFA + Age Model AUC")
+```
+
+## SOFA + Age + Elixhauser
+
+```{r}
+sofa_age_elixhauser_results <- data.frame(
+  Model = c("Logistic Regression", "GAM", "Elastic Net", "LightGBM"),
+  AUC = c(
+    get_best_result(model3)$ROC,
+    mean(unlist(results3)),
+    get_best_result(elnet3)$ROC,
+    cv_results3$best_score
+  )
+)
+kable(sofa_age_elixhauser_results, caption = "SOFA + Age + Elixhauser Model AUC")
+```
+
+# {-}
