@@ -69,9 +69,7 @@ write_files_to_duckdb <- function(files, tables_location, file_type, con) {
 }
 
 ## Needed tables
-true_tables <- list("clif_medication_admin_continuous", "clif_patient",
-                    "clif_hospitalization", "clif_adt", "clif_respiratory_support",
-                    "clif_labs", "clif_vitals", "clif_patient_assessments")
+true_tables <- list("clif_medication_admin_continuous", "clif_patient", "clif_hospitalization", "clif_adt", "clif_respiratory_support", "clif_labs", "clif_vitals", "clif_patient_assessments")
 
 # Access configuration parameters
 source("/Users/cdiaz/Desktop/SRP/SRP SOFA/utils/config.R")
@@ -533,6 +531,7 @@ library(dplyr)
 library(tidyr)
 library(kableExtra)
 library(stringr)
+library(htmltools)
 
 # Helper for median (IQR)
 med_iqr <- function(x) {
@@ -763,4 +762,20 @@ table1_df %>%
   kable("html", escape = FALSE, col.names = c("Variable", "Survivors", "Non-Survivors")) %>%
   kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"), full_width = FALSE) %>%
   scroll_box(width = "100%")
+
+
+# Export as a separate HTML file
+table1_html <- table1_df %>%
+  mutate(Variable = ifelse(stringr::str_detect(Variable, "^  "), 
+                      paste0("&nbsp;&nbsp;", stringr::str_trim(Variable)), 
+                      Variable)) %>%
+  kable("html", escape = FALSE, col.names = 
+          c("Variable", "Survivors", "Non-Survivors")) %>%
+  kable_styling(
+    bootstrap_options = c("striped", "hover", "condensed", "responsive"), 
+    full_width = FALSE) %>%
+  scroll_box(width = "100%")
+
+# Save to HTML file
+save_html(table1_html, file = "table1.html")
 ```
