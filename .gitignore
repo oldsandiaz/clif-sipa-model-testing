@@ -1,10 +1,14 @@
 # Ignore everything
 *
+
+# Allow directories (so .R and .Rmd files inside subfolders are tracked)
+!*/
+
 # But not these files...
 !*.R
 !*.Rmd
 !*.md
+!renv.lock
 
-# Allow directories (so .R and .Rmd files inside subfolders are tracked)
-!*/
+# Ignore RStudio project settings
 .Rproj.user
