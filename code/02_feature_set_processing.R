@@ -6,228 +6,160 @@
 library(arrow)
 library(tidyverse)
 library(stringr)
+library(data.table)
 
 # Clear env
 rm(list = ls())
 
 # Load data
 data <- read_parquet("/Users/cdiaz/Desktop/SRP/SRP SOFA/output/intermediate/sofaclif_cohort.parquet")
+setDT(data)
 
 ################
-### Summary functions for SOFA variables
+### Vectorized SOFA score calculation
 ################
 
-# Variables to create the SOFA score
-sofa_variables <- c("max_creatinine", 
-                    "min_plt_count", 
-                    "p_f_imputed",
-                    "dobutamine",
-                    "dobutamine_ne_eq",
-                    "phenylephrine",
-                    "phenylephrine_ne_eq",
-                    "dopamine",
-                    "dopamine_ne_eq",
-                    "epinephrine",
-                    "epinephrine_ne_eq",
-                    "gcs_total",
-                    "max_bilirubin",
-                    "min_map",
-                    "s_f",
-                    "norepinephrine")
-
-# Summary functions to use for each SOFA variable
-worst_functions <- list(
-  max_creatinine = max,
-  min_plt_count = min,
-  p_f_imputed = min,
-  dobutamine = max,
-  dobutamine_ne_eq = max,
-  phenylephrine = max,
-  phenylephrine_ne_eq = max,
-  dopamine = max,
-  dopamine_ne_eq = max,
-  epinephrine = max,
-  epinephrine_ne_eq = max,
-  gcs_total = min,
-  max_bilirubin = max,
-  min_map = min,
-  s_f = min,
-  norepinephrine = max
-)
-
-# For each hospitalization_id, summarize the SOFA variables from
-# window_start to life_support_start
-
-## First, pull all data within the window_start to life_support_start timeframe
-
-pre_ls_data <- data %>% 
-  mutate(
-    # Create time string with leading zero for hour
-    time_str = str_c(str_pad(meas_hour, 2, pad = "0"), "00", "00", sep = ":"),
-    # Concatenate date and time for datetime_str
-    datetime_str = str_c(meas_date, time_str, sep = " "),
-    # Now parse as POSIXct
-    meas_dttm = as.POSIXct(datetime_str, format = "%Y-%m-%d %H:%M:%S", tz = "UTC")
-  ) %>% 
-  select(-time_str, -datetime_str)
-
-# Filter for the relevant time window
-pre_ls_data <- pre_ls_data %>% 
-  filter(meas_dttm >= window_start & meas_dttm < life_support_start)
-
-# Now summarize the SOFA variables for each hospitalization_id
-df_sum <- pre_ls_data %>%
-  group_by(hospitalization_id) %>%
-  summarise(across(
-    names(worst_functions),
-    ~ worst_functions[[cur_column()]](., na.rm = TRUE)
-  ))
-
-# Rename the columns to match SOFA variable names
-df_sum <- df_sum %>% 
-  rename(
-    creatinine = max_creatinine,
-    platelets = min_plt_count,
-    p_f = p_f_imputed,
-    dobutamine = dobutamine,
-    phenylephrine = phenylephrine,
-    dopamine = dopamine,
-    gcs = gcs_total,
-    bilirubin = max_bilirubin,
-    map = min_map,
-    s_f = s_f,
-    norepinephrine = norepinephrine
-  )
-
-# Clean up the data: replace infinite values with NA and filter out rows
-df_sum <- df_sum %>%
-  mutate(across(
-    -hospitalization_id,
-    ~ ifelse(is.infinite(.), NA_real_, .)
-  ))
-
-# Remove rows where all SOFA variables are NA
-df_sum_clean <- df_sum %>%
-  filter(!if_all(-hospitalization_id, is.na))
-
-# Keep all columns from data df except sofa_variables
-data_clean <- data %>%
-  select(hospitalization_id, zipcode_nine_digit,
-         census_block_group_code, ethnicity_category,
-         age_at_admission, zipcode_five_digit, 
-         race_category, sex_category,
-         in_hospital_mortality) %>% 
-  distinct()
-
-# Join the summarized SOFA variables with the cleaned data 
-final_data <- df_sum_clean %>%
-  left_join(data_clean, by = "hospitalization_id")
-
-####################
-### COMPUTE SOFA SCORE FOR EACH HOSPITALIZATION
-####################
-
-# Define the SOFA score calculation function
-compute_sofa_score <- function(row) {
-  
-  # Extract the relevant variables from the row
-  p_f <- row$p_f
-  s_f <- row$s_f
-  platelets <- row$platelets
-  bilirubin <- row$bilirubin
-  map <- row$map
-  dopamine <- row$dopamine
-  dobutamine <- row$dobutamine
-  norepinephrine <- row$norepinephrine
-  epinephrine <- row$epinephrine
-  gcs <- row$gcs
-  creatinine <- row$creatinine
+compute_sofa_score_vec <- function(p_f, s_f, platelets, bilirubin, map, dopamine, dobutamine, norepinephrine, epinephrine, gcs, creatinine) {
   
   # Respiration (PaO2/FiO2 or SaO2/FiO2 ratio)
-  resp <- NA
-  if (!is.na(p_f)) {
-    if (p_f >= 400) 0
-    else if (p_f >= 300) 1
-    else if (p_f >= 200) 2
-    else if (p_f >= 100) 3
-    else 4
-  } else if (!is.na(s_f)) {
-    if (s_f > 301) 0
-    else if (s_f >= 221 && s_f <= 301) 1
-    else if (s_f >= 142 && s_f <= 220) 2
-    else if (s_f >= 67 && s_f <= 141) 3
-    else if (s_f < 67) 4
-  }
+  resp <- case_when(
+    !is.na(p_f) & p_f >= 400 ~ 0,
+    !is.na(p_f) & p_f >= 300 ~ 1,
+    !is.na(p_f) & p_f >= 200 ~ 2,
+    !is.na(p_f) & p_f >= 100 ~ 3,
+    !is.na(p_f) ~ 4,
+    !is.na(s_f) & s_f > 301 ~ 0,
+    !is.na(s_f) & s_f >= 221 ~ 1,
+    !is.na(s_f) & s_f >= 142 ~ 2,
+    !is.na(s_f) & s_f >= 67 ~ 3,
+    !is.na(s_f) ~ 4,
+    TRUE ~ NA_real_
+  )
   
   # Coagulation (platelet count)
-  coag <- if (!is.na(platelets)) {
-    if (platelets >= 150) 0
-    else if (platelets >= 100) 1
-    else if (platelets >= 50) 2
-    else if (platelets >= 20) 3
-    else 4
-  } else {
-    NA
-  }
+  coag <- case_when(
+    !is.na(platelets) & platelets >= 150 ~ 0,
+    !is.na(platelets) & platelets >= 100 ~ 1,
+    !is.na(platelets) & platelets >= 50 ~ 2,
+    !is.na(platelets) & platelets >= 20 ~ 3,
+    !is.na(platelets) ~ 4,
+    TRUE ~ NA_real_
+  )
   
   # Liver (bilirubin, mg/dl)
-  liver <- if (!is.na(bilirubin)) {
-    if (bilirubin < 1.2) 0
-    else if (bilirubin < 2.0) 1
-    else if (bilirubin < 6.0) 2
-    else if (bilirubin < 12.0) 3
-    else 4
-  } else {
-    NA
-  }
+  liver <- case_when(
+    !is.na(bilirubin) & bilirubin < 1.2 ~ 0,
+    !is.na(bilirubin) & bilirubin < 2.0 ~ 1,
+    !is.na(bilirubin) & bilirubin < 6.0 ~ 2,
+    !is.na(bilirubin) & bilirubin < 12.0 ~ 3,
+    !is.na(bilirubin) ~ 4,
+    TRUE ~ NA_real_
+  )
   
   # Cardiovascular
-  cv <- 0
-  # 1: MAP < 70 mmHg
-  if (!is.na(map) && map < 70) cv <- 1
-  # 2: Dopamine <= 5 or any dobutamine
-  if ((!is.na(dopamine) && dopamine > 0 && dopamine <= 5) || (!is.na(dobutamine) && dobutamine > 0)) cv <- 2
-  # 3: Dopamine > 5 or norepinephrine <= 0.1 or epinephrine <= 0.1
-  if ((!is.na(dopamine) && dopamine > 5) ||
-      (!is.na(norepinephrine) && norepinephrine > 0 && norepinephrine <= 0.1) ||
-      (!is.na(epinephrine) && epinephrine > 0 && epinephrine <= 0.1)) cv <- 3
-  # 4: Dopamine > 15 or norepinephrine > 0.1 or epinephrine > 0.1
-  if ((!is.na(dopamine) && dopamine > 15) ||
-      (!is.na(norepinephrine) && norepinephrine > 0.1) ||
-      (!is.na(epinephrine) && epinephrine > 0.1)) cv <- 4
+  cv <- case_when(
+    (!is.na(dopamine) & dopamine > 15) | (!is.na(norepinephrine) & norepinephrine > 0.1) | (!is.na(epinephrine) & epinephrine > 0.1) ~ 4,
+    (!is.na(dopamine) & dopamine > 5) | (!is.na(norepinephrine) & norepinephrine > 0 & norepinephrine <= 0.1) | (!is.na(epinephrine) & epinephrine > 0 & epinephrine <= 0.1) ~ 3,
+    (!is.na(dopamine) & dopamine > 0 & dopamine <= 5) | (!is.na(dobutamine) & dobutamine > 0) ~ 2,
+    !is.na(map) & map < 70 ~ 1,
+    TRUE ~ 0
+  )
   
   # CNS (GCS)
-  cns <- if (!is.na(gcs)) {
-    if (gcs == 15) 0
-    else if (gcs >= 13) 1
-    else if (gcs >= 10) 2
-    else if (gcs >= 6) 3
-    else 4
-  } else {
-    NA
-  }
+  cns <- case_when(
+    !is.na(gcs) & gcs == 15 ~ 0,
+    !is.na(gcs) & gcs >= 13 ~ 1,
+    !is.na(gcs) & gcs >= 10 ~ 2,
+    !is.na(gcs) & gcs >= 6 ~ 3,
+    !is.na(gcs) ~ 4,
+    TRUE ~ NA_real_
+  )
   
   # Renal (creatinine, mg/dl)
-  renal <- if (!is.na(creatinine)) {
-    if (creatinine < 1.2) 0
-    else if (creatinine < 2.0) 1
-    else if (creatinine < 3.5) 2
-    else if (creatinine < 5.0) 3
-    else 4
-  } else {
-    NA
-  }
+  renal <- case_when(
+    !is.na(creatinine) & creatinine < 1.2 ~ 0,
+    !is.na(creatinine) & creatinine < 2.0 ~ 1,
+    !is.na(creatinine) & creatinine < 3.5 ~ 2,
+    !is.na(creatinine) & creatinine < 5.0 ~ 3,
+    !is.na(creatinine) ~ 4,
+    TRUE ~ NA_real_
+  )
   
-  total_score <- sum(c(resp, coag, liver, cv, cns, renal), na.rm = TRUE)
-  return(total_score)
+  rowSums(cbind(resp, coag, liver, cv, cns, renal), na.rm = TRUE)
 }
 
-final_data <- final_data %>%
-  rowwise() %>%
-  mutate(sofa_score = compute_sofa_score(cur_data()))
-  
+# Calculate SOFA score for each hour
+data[, sofa_score := compute_sofa_score_vec(p_f_imputed, s_f, min_plt_count, max_bilirubin, min_map, dopamine, dobutamine, norepinephrine, epinephrine, gcs_total, max_creatinine)]
 
-# Export the final data as a parquet 
-write_parquet(final_data, 
-               "/Users/cdiaz/Desktop/SRP/SRP SOFA/output/intermediate/sipa_features.parquet")
+################
+### Summarize features
+################
 
+# Create datetime column
+data[, meas_dttm := as.POSIXct(paste(meas_date, sprintf("%02d:00:00", meas_hour)), format = "%Y-%m-%d %H:%M:%S", tz = "UTC")]
+
+# Define pre/post life support periods
+data[, period := ifelse(meas_dttm < life_support_start, "pre", "post")]
+
+# Define summary functions
+summary_functions <- list(
+  creatinine = function(x) max(x, na.rm = TRUE),
+  platelets = function(x) min(x, na.rm = TRUE),
+  p_f = function(x) min(x, na.rm = TRUE),
+  dobutamine = function(x) max(x, na.rm = TRUE),
+  phenylephrine = function(x) max(x, na.rm = TRUE),
+  dopamine = function(x) max(x, na.rm = TRUE),
+  epinephrine = function(x) max(x, na.rm = TRUE),
+  gcs = function(x) min(x, na.rm = TRUE),
+  bilirubin = function(x) max(x, na.rm = TRUE),
+  map = function(x) min(x, na.rm = TRUE),
+  s_f = function(x) min(x, na.rm = TRUE),
+  norepinephrine = function(x) max(x, na.rm = TRUE),
+  sofa_score = function(x) max(x, na.rm = TRUE),
+  vasopressin = function(x) max(x, na.rm = TRUE),
+  milrinone = function(x) max(x, na.rm = TRUE),
+  angiotensin = function(x) max(x, na.rm = TRUE)
+)
+
+# Columns to summarize
+vars_to_summarize <- c("max_creatinine", "min_plt_count", "p_f_imputed", 
+                       "dobutamine", "phenylephrine", "dopamine", 
+                       "epinephrine", "gcs_total", "max_bilirubin", 
+                       "min_map", "s_f", "norepinephrine", 
+                       "sofa_score", "vasopressin", "milrinone", "angiotensin")
+names(vars_to_summarize) <- c("creatinine", "platelets", "p_f", "dobutamine", 
+                              "phenylephrine", "dopamine", "epinephrine", 
+                              "gcs", "bilirubin", "map", "s_f", "norepinephrine", 
+                              "sofa_score", "vasopressin", "milrinone", "angiotensin")
+
+# Summarize data
+summarized_data <- data[, 
+  lapply(names(vars_to_summarize), function(var) summary_functions[[var]](.SD[[vars_to_summarize[var]]])),
+  by = .(hospitalization_id, period),
+  .SDcols = vars_to_summarize
+]
+
+setnames(summarized_data, old = paste0("V", 1:length(vars_to_summarize)), new = names(vars_to_summarize))
+
+# Reshape data to wide format
+wide_data <- dcast(summarized_data, hospitalization_id ~ period, value.var = names(vars_to_summarize))
+
+# Clean up infinite values
+for (col in names(wide_data)) {
+  if (is.numeric(wide_data[[col]])) {
+    set(wide_data, i = which(is.infinite(wide_data[[col]])), j = col, value = NA)
+  }
+}
+
+# Get patient demographics
+patient_data <- unique(data[, .(patient_id, hospitalization_id, zipcode_nine_digit, census_block_group_code, ethnicity_category, age_at_admission, zipcode_five_digit, race_category, sex_category, in_hospital_mortality)])
+
+# Join summarized data with patient data
+final_data <- merge(patient_data, wide_data, by = "hospitalization_id", all.x = TRUE)
+
+# Remove rows where all pre-life support data is NA or 0
+pre_cols <- names(final_data)[grepl("_pre$", names(final_data))]
+final_data <- final_data[rowSums(final_data[, ..pre_cols] == 0 | is.na(final_data[, ..pre_cols]), na.rm = TRUE) < length(pre_cols)]
+
+# Export final data
+write_parquet(final_data, "/Users/cdiaz/Desktop/SRP/SRP SOFA/output/intermediate/sipa_features.parquet")
