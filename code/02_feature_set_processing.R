@@ -3,22 +3,31 @@
 #################################################
 
 # Load necessary libraries
+print("Initialized Feature Set Processing Script")
+
 library(arrow)
 library(tidyverse)
 library(stringr)
 library(data.table)
-
+library(tictoc)
 # Clear env
 rm(list = ls())
 
+# Path
+source("utils/config.R")
+output_path <- config$output_path
+
 # Load data
-data <- read_parquet("/Users/cdiaz/Desktop/SRP/SRP SOFA/output/intermediate/sofaclif_cohort.parquet")
+data <- read_parquet(paste0(output_path, "/sipa_clif_cohort.parquet"))
+
+# Convert to data.table
 setDT(data)
 
 ################
 ### Vectorized SOFA score calculation
 ################
 
+tic()
 compute_sofa_score_vec <- function(p_f, s_f, platelets, bilirubin, map, dopamine, dobutamine, norepinephrine, epinephrine, gcs, creatinine) {
   
   # Respiration (PaO2/FiO2 or SaO2/FiO2 ratio)
@@ -118,7 +127,9 @@ summary_functions <- list(
   sofa_score = function(x) max(x, na.rm = TRUE),
   vasopressin = function(x) max(x, na.rm = TRUE),
   milrinone = function(x) max(x, na.rm = TRUE),
-  angiotensin = function(x) max(x, na.rm = TRUE)
+  angiotensin = function(x) max(x, na.rm = TRUE),
+  metaraminol = function(x) max(x, na.rm = TRUE),
+  norepinephrine_eq = function(x) max(x, na.rm = TRUE)
 )
 
 # Columns to summarize
@@ -126,11 +137,11 @@ vars_to_summarize <- c("max_creatinine", "min_plt_count", "p_f_imputed",
                        "dobutamine", "phenylephrine", "dopamine", 
                        "epinephrine", "gcs_total", "max_bilirubin", 
                        "min_map", "s_f", "norepinephrine", 
-                       "sofa_score", "vasopressin", "milrinone", "angiotensin")
+                       "sofa_score", "vasopressin", "milrinone", "angiotensin", "metaraminol", "norepinephrine_eq")
 names(vars_to_summarize) <- c("creatinine", "platelets", "p_f", "dobutamine", 
                               "phenylephrine", "dopamine", "epinephrine", 
                               "gcs", "bilirubin", "map", "s_f", "norepinephrine", 
-                              "sofa_score", "vasopressin", "milrinone", "angiotensin")
+                              "sofa_score", "vasopressin", "milrinone", "angiotensin", "metaraminol", "norepinephrine_eq")
 
 # Summarize data
 summarized_data <- data[, 
@@ -144,6 +155,7 @@ setnames(summarized_data, old = paste0("V", 1:length(vars_to_summarize)), new = 
 # Reshape data to wide format
 wide_data <- dcast(summarized_data, hospitalization_id ~ period, value.var = names(vars_to_summarize))
 
+
 # Clean up infinite values
 for (col in names(wide_data)) {
   if (is.numeric(wide_data[[col]])) {
@@ -152,14 +164,12 @@ for (col in names(wide_data)) {
 }
 
 # Get patient demographics
-patient_data <- unique(data[, .(patient_id, hospitalization_id, zipcode_nine_digit, census_block_group_code, ethnicity_category, age_at_admission, zipcode_five_digit, race_category, sex_category, in_hospital_mortality)])
+patient_data <- unique(data[, .(patient_id, hospitalization_id, ethnicity_category, age_at_admission, race_category, sex_category, in_hospital_mortality)])
 
 # Join summarized data with patient data
 final_data <- merge(patient_data, wide_data, by = "hospitalization_id", all.x = TRUE)
 
-# Remove rows where all pre-life support data is NA or 0
-pre_cols <- names(final_data)[grepl("_pre$", names(final_data))]
-final_data <- final_data[rowSums(final_data[, ..pre_cols] == 0 | is.na(final_data[, ..pre_cols]), na.rm = TRUE) < length(pre_cols)]
-
 # Export final data
-write_parquet(final_data, "/Users/cdiaz/Desktop/SRP/SRP SOFA/output/intermediate/sipa_features.parquet")
+write_parquet(final_data, paste0(output_path, "/sipa_features.parquet"))
+toc()
+print("Feature set exported to output_path")

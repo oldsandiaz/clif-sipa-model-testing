@@ -4,14 +4,12 @@
 
 rm(list = ls())
 
-# Output path
-output_path <- "/Users/cdiaz/Desktop/SRP/SRP SOFA/output/intermediate"
-
 # Access configuration parameters
 source("utils/config.R")
 site_name <- config$site_name
 tables_path <- config$tables_path
 file_type <- config$file_type
+output_path <- config$output_path
 
 # Load necessary libraries
 library(lubridate)
@@ -26,7 +24,6 @@ library(tidyverse)
 clif_respiratory_support <- read_parquet(file.path(tables_path, paste0("clif_respiratory_support", file_type)))
 clif_adt <- read_parquet(file.path(tables_path, paste0("clif_adt", file_type)))
 
-
 # Process the data
 # Courtesy of Nick Ingraham
 #~~~~~~~~~~~~~~~~
@@ -40,7 +37,6 @@ clif_adt <- read_parquet(file.path(tables_path, paste0("clif_adt", file_type)))
 
 hour_sequence <- clif_respiratory_support |> 
   group_by(hospitalization_id)  |> 
-  
   reframe(recorded_dttm = seq(fmin(recorded_dttm), fmax(recorded_dttm), by = "1 hour")) |>
   # Adjust to the last second of the hour using lubridate's floor_date
   mutate(recorded_dttm = floor_date(recorded_dttm, "hour") + minutes(59) + seconds(59)) |> 
@@ -135,12 +131,12 @@ df_resp_support_1 <- df_resp_support_1 |>
       fcase(
         is.na(device_category) & is.na(device_name) &
           str_detect(mode_category, "assist control-volume control|simv|pressure control"),
-        "imv",
+        "IMV",
         rep_len(TRUE, length(device_category)), device_category
       ),
     device_name = 
       fcase(
-        str_detect(device_category, "imv") & is.na(device_name) &
+        str_detect(device_category, "IMV") & is.na(device_name) &
           str_detect(mode_category, "assist control-volume control|simv|pressure control"),
         "mechanical ventilator",
         rep_len(TRUE, length(device_name)), device_name
@@ -151,47 +147,47 @@ df_resp_support_1 <- df_resp_support_1 |>
   # fixing other vent things
   #     If device before is VENT + normal vent things ... its VENT too 
   mutate(device_category = fcase(is.na(device_category) & 
-                                   lag(device_category == "imv") & 
+                                   lag(device_category == "IMV") & 
                                    tidal_volume_set > 1 & 
                                    resp_rate_set > 1 & 
                                    peep_set > 1, 
-                                 "imv", 
+                                 "IMV", 
                                  rep_len(TRUE, length(device_category)), device_category)) |>
   
   #     If device after is VENT + normal vent things ... its VENT too 
   mutate(device_category = fcase(is.na(device_category) & 
-                                   lead(device_category == "imv") & 
+                                   lead(device_category == "IMV") & 
                                    tidal_volume_set > 1 & 
                                    resp_rate_set > 1 & 
                                    peep_set > 1, 
-                                 "imv", 
+                                 "IMV", 
                                  rep_len(TRUE, length(device_category)), device_category)) |>
   
   # same as above for device_name ^^^^^^^^^^^
-  mutate(device_name = fcase(is.na(device_name) & lag(device_category == "imv") & tidal_volume_set > 1 & resp_rate_set > 1 & peep_set > 1, 
+  mutate(device_name = fcase(is.na(device_name) & lag(device_category == "IMV") & tidal_volume_set > 1 & resp_rate_set > 1 & peep_set > 1, 
                              "mechanical ventilation", 
                              rep_len(TRUE, length(device_name)), device_name)) |> 
   
-  mutate(device_name = fcase(is.na(device_name) & lead(device_category == "imv") & tidal_volume_set > 1 & resp_rate_set > 1 & peep_set > 1, 
+  mutate(device_name = fcase(is.na(device_name) & lead(device_category == "IMV") & tidal_volume_set > 1 & resp_rate_set > 1 & peep_set > 1, 
                              "mechanical ventilation", 
                              rep_len(TRUE, length(device_name)), device_name)) |> 
   
   
   # doing this for BiPAP as well 
   mutate(device_category = fcase(is.na(device_category) & 
-                                   lag(device_category == "nippv") & 
+                                   lag(device_category == "NIPPV") & 
                                    # minute_vent_obs > 1 & 
                                    peak_inspiratory_pressure_obs > 1 & 
                                    pressure_support_set > 1, 
-                                 "nippv", 
+                                 "NIPPV", 
                                  rep_len(TRUE, length(device_category)), device_category)) |>
   
   mutate(device_category = fcase(is.na(device_category) & 
-                                   lead(device_category == "nippv") & 
+                                   lead(device_category == "NIPPV") & 
                                    # minute_vent_obs > 1 & 
                                    peak_inspiratory_pressure_obs > 1 & 
                                    pressure_support_set > 1, 
-                                 "nippv", 
+                                 "NIPPV", 
                                  rep_len(TRUE, length(device_category)), device_category)) |>
   
   
@@ -204,16 +200,16 @@ df_resp_support_1 <- df_resp_support_1 |>
     device_category = 
       fcase(
         is.na(device_category) & 
-          (lag(device_category == "imv") | lead(device_category == "imv")) & 
+          (lag(device_category == "IMV") | lead(device_category == "IMV")) & 
           !str_detect(device_name, "trach") &
           tidal_volume_set > 0 & 
           resp_rate_set > 0,
-        "imv",
+        "IMV",
         rep_len(TRUE, length(device_category)), device_category),
     device_name = 
       fcase(
         is.na(device_name) & 
-          (lag(device_category == "imv") | lead(device_category == "imv")) & 
+          (lag(device_category == "IMV") | lead(device_category == "IMV")) & 
           !str_detect(device_name, "trach") &
           tidal_volume_set > 0 & 
           resp_rate_set > 0,
@@ -222,7 +218,7 @@ df_resp_support_1 <- df_resp_support_1 |>
     mode_category = 
       fcase(
         is.na(mode_category) & 
-          (lag(device_category == "imv") | lead(device_category == "imv")) & 
+          (lag(device_category == "IMV") | lead(device_category == "IMV")) & 
           !str_detect(device_name, "trach") &
           tidal_volume_set > 0 & 
           resp_rate_set > 0,
@@ -231,7 +227,7 @@ df_resp_support_1 <- df_resp_support_1 |>
     mode_name = 
       fcase(
         is.na(mode_name) & 
-          (lag(device_category == "imv") | lead(device_category == "imv")) & 
+          (lag(device_category == "IMV") | lead(device_category == "IMV")) & 
           !str_detect(device_name, "trach") &
           tidal_volume_set > 0 & 
           resp_rate_set > 0,
@@ -245,13 +241,13 @@ df_resp_support_1 <- df_resp_support_1 |>
   
   # when bipap is part of a duplicate we need to get rid of it... 
   #     its usually when a vent is STARTED and device is carried over but it goes to a new line with lots of NAs
-  #     the NA line above has the vent settings.  Its best to just drop the nippv line when its a duplicate
+  #     the NA line above has the vent settings.  Its best to just drop the NIPPV line when its a duplicate
   #     if we don't do this... the vent settings get sent backwards across all bipap
   
   mutate(n = n()) |>  
   filter(
-    #  essentially this is... DROP if n>1 and device_cat == nippv
-    !(n > 1 & device_category == "nippv")) |> 
+    #  essentially this is... DROP if n>1 and device_cat == NIPPV
+    !(n > 1 & device_category == "NIPPV")) |> 
   
   # redo n so we keep vent settings from above... now NAs are bad around other things and we should just drop
   mutate(n = n()) |> 
@@ -261,7 +257,7 @@ df_resp_support_1 <- df_resp_support_1 |>
   
   # random carried over bipap sometimes when there is trach next and there is vent before
   filter(
-    !(device_category == "nippv" & lead(device_category == "trach collar") & lag(device_category != "nippv"))
+    !(device_category == "NIPPV" & lead(device_category == "Trach Collar") & lag(device_category != "NIPPV"))
   ) |>
   
   
@@ -288,7 +284,7 @@ df_resp_support_1 <- df_resp_support_1 |>
   group_by(hospitalization_id) |>
   arrange(hospitalization_id, recorded_dttm) |>
   filter(
-    !(device_category == "nasal cannula" & lead(device_category == "imv") & lag(device_category == "imv"))
+    !(device_category == "Nasal Cannula" & lead(device_category == "IMV") & lag(device_category == "IMV"))
   ) |>
   ###########
 # TEMP STOP #
@@ -395,7 +391,7 @@ df_resp_support <- df_resp_support_1 |>
   
   
   # changing fio2_set to 0.21 if room air as category
-  mutate(fio2_set = if_else(is.na(fio2_set) & device_category == "room air", 21, fio2_set)) |> 
+  mutate(fio2_set = if_else(is.na(fio2_set) & device_category == "Room Air", 0.21, fio2_set)) |> 
   
   # erroneous set volumes are in places where they shouldn't be for PS and trach_dome
   mutate(
@@ -494,47 +490,45 @@ rm(clif_adt)
 rm(clif_respiratory_support)
 
 
-# FiO2 Imputation
-## First map device from Nick's table to device_name
-mapping <- read_csv("code/lookup tables/device_name_mapper.csv")
-mapping_no_dupes <- mapping %>% 
-  filter(!is.na(device_name), device_name != "") %>% 
-  distinct(device_name, .keep_all = TRUE)
+# Load the device_category to ranges mapping table
+category_values <- read_csv("lookup-tables/device_category_to_conversion.csv")
 
+# Ensure device_category is trimmed of whitespace and merge with mapping
 df_resp_support <- df_resp_support %>%
-  left_join(mapping_no_dupes, by ="device_name")
+  mutate(device_category = str_trim(device_category)) %>%
+  left_join(category_values, by = "device_category")
 
-## Merge ranges and conversion values
-fio2_conversion <- read_csv("code/lookup tables/device_conversion_table_updated.csv")
-
-df_resp_support_conv <- df_resp_support %>%
-  left_join(fio2_conversion, by = "device") 
-
-## Check ranges for fio2_set
-df_resp_support_conv <- df_resp_support_conv %>% 
+# Check ranges for fio2_set
+df_resp_support_conv <- df_resp_support %>% 
   mutate(fio2_set = case_when(
-    !is.na(fio2_set) & fio2_set < range_lower ~ range_lower,
-    !is.na(fio2_set) & fio2_set > range_upper ~ range_upper,
-    TRUE ~ fio2_set
-  ))
+    !is.na(fio2_set) & !is.na(range_lower) & fio2_set < range_lower ~ range_lower,
+    !is.na(fio2_set) & !is.na(range_upper) & fio2_set > range_upper ~ range_upper,
+    TRUE ~ fio2_set))
 
-## Impute FiO2 values when fio2_set == NA and lpm_set != NA
-## Ensure that imputed values fall within the defined ranges
+# Impute FiO2 values when fio2_set is NA and lpm_set is not NA
 df_resp_support_conv <- df_resp_support_conv %>%
   mutate(fio2_set = case_when(
     is.na(fio2_set) & !is.na(lpm_set) & !is.na(conversion) ~ {
       fio2_imp <- 0.21 + lpm_set * conversion
       pmin(pmax(fio2_imp, range_lower), range_upper)
     },
-    TRUE ~ fio2_set
-  ))
+    TRUE ~ fio2_set))
 
-## Rename fio2_set to fio2_approx
+# Rename fio2_set to fio2_approx
 df_resp_support_conv <- df_resp_support_conv %>% 
   rename(fio2_approx = fio2_set)
 
 summary(df_resp_support$fio2_set)
 summary(df_resp_support_conv$fio2_approx)
 
+# If there are still NA values in fio2_approx, set them to range_lower if available
+df_resp_support_conv <- df_resp_support_conv %>%
+  mutate(fio2_approx = ifelse(is.na(fio2_approx) & !is.na(range_lower), range_lower, fio2_approx)) %>% 
+  # Ensure fio2_approx is 0.21 for Room Air, as lookup table doesn't provide range_lower
+  mutate(fio2_approx = ifelse(device_category == "Room Air", 0.21, fio2_approx)) 
+
+summary(df_resp_support_conv$fio2_approx)
+
 # Save the processed data
 write_parquet(df_resp_support_conv, file.path(output_path, paste0("clif_respiratory_support_processed", file_type)))
+print("Table exported as parquet to output_path")
