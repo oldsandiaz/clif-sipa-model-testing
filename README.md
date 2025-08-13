@@ -65,4 +65,4 @@ Rscript code/04_model_training.R
 
 4.  `03_table1.R`. This script outputs data needed to create a Table 1. It also outputs a STROBE diagram.
 
-5.  `04_model_training.R` This script trains the models and outputs the results.
+5.  `04_model_testing.R` This script tests the models and outputs the results. This script REQUIRES the best model objects, saved as RDS, to be in the models folder
